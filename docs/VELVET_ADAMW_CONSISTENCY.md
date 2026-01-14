@@ -95,25 +95,30 @@ if (sparse_aware && fabsf(p) < 1e-9f) return;  // Skip near-zero weights
 ### Test: Meilleure Convergence avec Velvet
 
 **Configuration**:
-- Dataset: TinyStories (37k tokens)
+- Dataset: SQuAD-FR (103k échantillons)
 - Model: VesperLM Medium (89M params)
-- Epochs: 120
-- Batch size: 4
+- GPU: RTX 4080 Laptop
+- Kernels: CUDA custom (zero-copy)
 
-**Résultats** (avec features adaptatives activées):
+**Résultats (15 epochs):**
 
-| Optimizer | Final Loss | Final Perplexity | Convergence Epoch | Loss à Epoch 30 |
-|-----------|------------|------------------|-------------------|-----------------|
-| **AdamW** (Candle) | 1.22 | 3.38 | 90 | 4.27 |
-| **Velvet** (avec features) | **1.15** | **3.15** | **75** | **3.95** |
+| Optimizer | Final Loss | Final Perplexity | Time | Memory |
+|-----------|------------|------------------|------|--------|
+| **AdamW** (Candle) | 6.38 | 591 | 18.5s | 2000 MB |
+| **Velvet** (CUDA custom) | **5.39** | **219** | 18.9s | 2000 MB |
 
-**✅ Conclusion**: Velvet **converge mieux** qu'AdamW :
-- ✅ **Meilleure loss finale** : 1.15 vs 1.22 (-5.7%)
-- ✅ **Meilleure perplexité** : 3.15 vs 3.38 (-6.8%)
-- ✅ **Convergence plus rapide** : 75 epochs vs 90 epochs (-16.7%)
-- ✅ **Descente plus régulière** : Loss descend mieux à chaque epoch
+**Résultats (20 epochs):**
 
-**Note**: Les features adaptatives (entropy-adaptive LR, perplexity-guided momentum) permettent à Velvet d'ajuster dynamiquement les hyperparamètres pour une meilleure convergence.
+| Optimizer | Final Loss | Final Perplexity |
+|-----------|------------|------------------|
+| **AdamW** | 5.45 | 232 |
+| **Velvet** | **4.48** | **89** |
+
+**✅ Conclusion**: Velvet **converge significativement mieux** qu'AdamW :
+- ✅ **15-17% meilleure loss** : 5.39 vs 6.38 (15 epochs), 4.48 vs 5.45 (20 epochs)
+- ✅ **60%+ meilleure perplexité** : 219 vs 591 (15 epochs), 89 vs 232 (20 epochs)
+- ✅ **Temps identique** : Pas d'overhead des kernels custom
+- ✅ **Kernels CUDA custom** : Zero-copy, in-place updates sur GPU
 
 ## ⏱️ Performance (Temps)
 

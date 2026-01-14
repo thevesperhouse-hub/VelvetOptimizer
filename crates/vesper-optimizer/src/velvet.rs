@@ -1,9 +1,13 @@
 //! Velvet Optimizer Implementation
 //! 
 //! High-performance optimizer with adaptive features
+//! Utilise les kernels CUDA custom quand disponible
 
-use candle_core::{Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 use std::collections::HashMap;
+
+#[cfg(feature = "cuda")]
+use crate::cuda::velvet_update_cuda;
 
 #[derive(Debug, Clone)]
 pub struct VelvetConfig {
@@ -107,60 +111,69 @@ impl VelvetOptimizer {
         let state = self.state.get_mut(name).unwrap();
         state.step += 1;
 
-        // Bias corrections (AdamW standard formula)
-        // m_hat = m / (1 - beta1^t)
-        // v_hat = v / (1 - beta2^t)
+        // Bias corrections
         let bias_correction1 = 1.0 - self.config.beta1.powi(state.step as i32);
         let bias_correction2 = 1.0 - self.config.beta2.powi(state.step as i32);
 
-        // Apply adaptive LR if enabled
+        // Adaptive LR
         let effective_lr = if self.config.entropy_adaptive {
             self.config.lr * self.entropy_scale
         } else {
             self.config.lr
         };
 
-        // Apply adaptive momentum if enabled
+        // Adaptive momentum
         let effective_beta1 = if self.config.perplexity_guided {
             (self.config.beta1 * self.perplexity_scale).clamp(0.5, 0.999)
         } else {
             self.config.beta1
         };
 
-        // Extract state values to avoid borrow conflicts
+        // ===== CUDA KERNEL PATH =====
+        #[cfg(feature = "cuda")]
+        if matches!(param.device(), Device::Cuda(_)) {
+            let state = self.state.get(name).unwrap();
+            velvet_update_cuda(
+                param,
+                &state.m,
+                &state.v,
+                grad,
+                effective_lr as f32,
+                effective_beta1 as f32,
+                self.config.beta2 as f32,
+                self.config.eps as f32,
+                self.config.weight_decay as f32,
+                bias_correction1 as f32,
+                bias_correction2 as f32,
+                self.config.entropy_adaptive,
+                self.entropy_scale as f32,
+                self.config.perplexity_guided,
+                self.perplexity_scale as f32,
+                self.config.sparse_aware,
+            )?;
+            return Ok(());
+        }
+
+        // ===== CPU FALLBACK (Candle ops) =====
         let config_beta2 = self.config.beta2;
         let config_eps = self.config.eps;
         let config_wd = self.config.weight_decay;
 
-        // ===== ADAMW STANDARD FORMULA (with optional adaptive features) =====
-        // 
-        // Step 1: Decoupled weight decay (AdamW style, not Adam)
-        //   p = p * (1 - lr * wd)
-        // This is applied BEFORE momentum update (key difference from Adam)
+        // Decoupled weight decay
         *param = (param.clone() * (1.0 - effective_lr * config_wd))?;
 
-        // Step 2: Update moments (standard Adam formula)
-        //   m = beta1 * m + (1 - beta1) * g
-        //   v = beta2 * v + (1 - beta2) * g^2
+        // Update moments
         let state = self.state.get_mut(name).unwrap();
         state.m = (state.m.clone() * effective_beta1)?.add(&(grad * (1.0 - effective_beta1))?)?;
         state.v = (state.v.clone() * config_beta2)?.add(&(grad.sqr()? * (1.0 - config_beta2))?)?;
 
-        // Step 3: Bias-corrected moments (Adam standard)
-        //   m_hat = m / (1 - beta1^t)
-        //   v_hat = v / (1 - beta2^t)
+        // Bias-corrected moments
         let m_hat = (state.m.clone() / bias_correction1)?;
         let v_hat = (state.v.clone() / bias_correction2)?;
 
-        // Step 4: Parameter update (Adam standard)
-        //   p = p - lr * m_hat / (sqrt(v_hat) + eps)
+        // Parameter update
         let update = (m_hat / (v_hat.sqrt()? + config_eps)?)?;
         *param = (param.clone() - (update * effective_lr)?)?;
-        
-        // NOTE: When entropy_adaptive=false and perplexity_guided=false,
-        //       this is IDENTICAL to AdamW. The adaptive features only modify:
-        //       - effective_lr (entropy_adaptive)
-        //       - effective_beta1 (perplexity_guided)
 
         Ok(())
     }

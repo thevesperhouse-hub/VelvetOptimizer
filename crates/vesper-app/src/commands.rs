@@ -786,6 +786,7 @@ pub struct DatasetFormatInfo {
 }
 
 // Helper pour formater le nombre de paramètres
+#[allow(dead_code)]
 fn format_params(n: usize) -> String {
     if n >= 1_000_000_000 {
         format!("{:.1}B", n as f64 / 1_000_000_000.0)
@@ -1524,8 +1525,6 @@ fn build_onnx_model(
     embedding_weights: &[f32],
     output_weights: &[f32],
 ) -> Vec<u8> {
-    use byteorder::{LittleEndian, WriteBytesExt};
-    
     let mut data = Vec::new();
     
     // ONNX utilise protobuf. On va créer une version simplifiée mais valide.
@@ -1965,7 +1964,7 @@ async fn load_and_generate_safetensors(
     prompt: &str,
     max_tokens: usize,
 ) -> Result<String, String> {
-    use candle_core::{Device, Tensor, DType, IndexOp};
+    use candle_core::{Device, Tensor};
     
     // Charger les tenseurs
     let device = if candle_core::utils::cuda_is_available() {

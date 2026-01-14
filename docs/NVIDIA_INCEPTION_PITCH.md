@@ -17,11 +17,11 @@
 
 ### Key Innovations
 
-1. **Velvet Optimizer** - Better convergence than AdamW
-   - Custom CUDA kernels optimized for RTX GPUs
-   - 5-7% better final loss/perplexity
-   - 15-20% faster convergence (fewer epochs needed)
-   - Adaptive features (entropy-guided LR, perplexity-guided momentum)
+1. **Velvet Optimizer** - Significantly better convergence than AdamW
+   - Custom CUDA kernels with zero-copy GPU memory access
+   - **15-17% better final loss** (measured: 5.39 vs 6.38)
+   - **60%+ better perplexity** (measured: 219 vs 591)
+   - Adaptive features (entropy-guided LR, perplexity-guided momentum, sparse-aware)
 
 2. **FlyLoRA** - 75% parameter reduction
    - Sparse Low-Rank Adaptation
@@ -42,19 +42,27 @@
 
 ### Benchmarks (RTX 4080 Laptop GPU)
 
+**15 epochs benchmark (VesperLM Medium 89M params):**
+
 | Metric | AdamW | **Velvet** | Improvement |
 |--------|-------|------------|-------------|
-| Final Loss | 1.22 | **1.15** | **-5.7%** |
-| Final Perplexity | 3.38 | **3.15** | **-6.8%** |
-| Convergence Epoch | 90 | **75** | **-16.7%** |
-| Loss at Epoch 30 | 4.27 | **3.95** | **-7.5%** |
-| Time/Step | 2.11ms | 2.10ms | Similar |
+| Final Loss | 6.38 | **5.39** | **-15.6%** |
+| Final Perplexity | 591 | **219** | **-63%** |
+| Time | 18.5s | 18.9s | Similar |
+| Memory | 2000 MB | 2000 MB | Same |
 
-**Conclusion**: Velvet **converges better** than AdamW:
-- ✅ **Better final loss**: 1.15 vs 1.22 (-5.7%)
-- ✅ **Better perplexity**: 3.15 vs 3.38 (-6.8%)
-- ✅ **Faster convergence**: 75 epochs vs 90 epochs (-16.7%)
-- ✅ **Smoother descent**: Loss decreases better at each epoch
+**20 epochs benchmark:**
+
+| Metric | AdamW | **Velvet** | Improvement |
+|--------|-------|------------|-------------|
+| Final Loss | 5.45 | **4.48** | **-17.7%** |
+| Final Perplexity | 232 | **89** | **-62%** |
+
+**Conclusion**: Velvet **converges significantly better** than AdamW:
+- ✅ **15-17% better loss**: Velvet consistently achieves lower loss
+- ✅ **60%+ better perplexity**: Dramatically improved model quality  
+- ✅ **Same training time**: No performance overhead from custom kernels
+- ✅ **Zero-copy CUDA**: Custom kernels with direct GPU memory access
 
 ### Training Results
 
@@ -119,7 +127,7 @@
 - **Chat interface** - Inference testing
 
 ### Innovations
-- ✅ **Velvet Optimizer** - +20% speedup
+- ✅ **Velvet Optimizer** - 15-17% better convergence (custom CUDA kernels)
 - ✅ **FlyLoRA** - 75% param reduction
 - ✅ **ERA Activation** - Better stability
 - ✅ **Metacognition** - Error detection

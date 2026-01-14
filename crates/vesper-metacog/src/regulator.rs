@@ -27,7 +27,9 @@ impl Default for RegulatorConfig {
 }
 
 pub struct MetacognitiveRegulator {
+    #[allow(dead_code)]
     config: RegulatorConfig,
+    #[allow(dead_code)]
     meta_head: MetaHead,
 }
 

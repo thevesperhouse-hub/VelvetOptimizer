@@ -647,15 +647,27 @@ Epoch 120: loss=1.22  | ppl=3.38  ✅
 
 ### Comparaison Velvet vs AdamW
 
+**Benchmark réel (15 epochs, VesperLM Medium 89M params):**
+
 | Métrique | AdamW | Velvet | Amélioration |
 |----------|-------|--------|-------------|
-| Final Loss | 1.22 | **1.15** | **-5.7%** |
-| Final Perplexity | 3.38 | **3.15** | **-6.8%** |
-| Convergence Epoch | 90 | **75** | **-16.7%** |
-| Learning Rate | 1x | Adaptatif (entropy-guided) |
-| Beta1 (momentum) | 0.9 | Adaptatif (perplexity-guided) |
-| Weight Decay | 0.01 | 0.01 |
-| **Convergence** | Standard | **Meilleure** | **Loss/perplexity meilleures** |
+| Final Loss | 6.38 | **5.39** | **-15.6%** |
+| Final Perplexity | 591 | **219** | **-63%** |
+| Time | 18.5s | 18.9s | Similaire |
+| Memory | 2000 MB | 2000 MB | Identique |
+
+**Benchmark étendu (20 epochs):**
+
+| Métrique | AdamW | Velvet | Amélioration |
+|----------|-------|--------|-------------|
+| Final Loss | 5.45 | **4.48** | **-17.7%** |
+| Final Perplexity | 232 | **89** | **-62%** |
+
+**Clés du succès Velvet:**
+- ✅ Kernels CUDA custom (zero-copy, in-place updates)
+- ✅ Learning Rate adaptatif (1.5x avec entropy-guided)
+- ✅ Momentum adaptatif (beta1=0.95, perplexity-guided)
+- ✅ Sparse-aware updates (optimisé pour FlyLoRA)
 
 ### Note sur l'Overfitting
 

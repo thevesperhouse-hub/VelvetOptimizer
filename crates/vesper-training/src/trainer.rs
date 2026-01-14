@@ -1,13 +1,13 @@
 //! Training orchestration
 
 use anyhow::Result;
-use candle_core::{Device, Tensor, DType};
-use candle_nn::{loss::cross_entropy, VarMap, VarBuilder};
+use candle_core::{Device, Tensor};
+use candle_nn::loss::cross_entropy;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 
-use vesper_core::{VesperLM, VesperConfig};
-use vesper_optimizer::{VelvetOptimizer, VelvetConfig};
+use vesper_core::VesperLM;
+use vesper_optimizer::VelvetOptimizer;
 use crate::dataset::Dataset;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,8 +146,8 @@ impl Trainer {
         }
 
         // Convert to tensors
-        let batch_size = input_ids_batch.len();
-        let seq_len = input_ids_batch[0].len();
+        let _batch_size = input_ids_batch.len();
+        let _seq_len = input_ids_batch[0].len();
 
         let input_ids = Tensor::new(input_ids_batch, &self.device)?;
         let attention_mask = Tensor::new(attention_mask_batch, &self.device)?;

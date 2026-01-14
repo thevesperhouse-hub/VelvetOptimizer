@@ -21,6 +21,7 @@ pub struct FlyLoRALinear {
     base: Linear,
     
     // Sparse projection A (frozen, 25% sparse)
+    #[allow(dead_code)]
     proj_a: Tensor,
     
     // Learnable low-rank matrices
