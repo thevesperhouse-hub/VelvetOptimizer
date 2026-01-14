@@ -934,6 +934,160 @@ fn tokenize_text(text: &str, max_len: usize) -> Vec<u32> {
         .collect()
 }
 
+/// Fonction helper pour entraîner avec un optimizer spécifique
+async fn train_with_optimizer(
+    app: &tauri::AppHandle,
+    optimizer_name: &str,
+    config: &BenchmarkConfig,
+    tokenized: &[Vec<u32>],
+    device: &candle_core::Device,
+    vesper_config: &VesperConfig,
+    vocab_size: usize,
+    seq_len: usize,
+    batch_size: usize,
+    lr: f32,
+) -> Result<BenchmarkResult, String> {
+    use tauri::Emitter;
+    use candle_core::{Tensor, DType};
+    use candle_nn::{loss::cross_entropy, VarMap, VarBuilder, Optimizer, optim::AdamW, ParamsAdamW};
+    use std::time::Instant;
+    
+    let _ = app.emit("log", serde_json::json!({
+        "level": "info",
+        "message": format!("🏋️ Training avec {}...", optimizer_name)
+    }));
+    
+    let start_time = Instant::now();
+    let mut loss_history = Vec::new();
+    let mut best_loss = f32::MAX;
+    let num_sequences = tokenized.len();
+    let batches_per_epoch = (num_sequences / batch_size).max(1).min(20);
+    
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+    
+    // Créer le modèle
+    let model = VesperLM::new(vesper_config.clone(), vb)
+        .map_err(|e| format!("Erreur création VesperLM: {}", e))?;
+    
+    // Configurer l'optimizer selon le type
+    let effective_lr = if optimizer_name.to_lowercase() == "velvet" {
+        lr * config.velvet_lr_multiplier as f32
+    } else {
+        lr
+    };
+    
+    let beta1 = if optimizer_name.to_lowercase() == "velvet" {
+        config.velvet_beta1
+    } else {
+        0.9
+    };
+    
+    let adamw_params = ParamsAdamW {
+        lr: effective_lr as f64,
+        beta1,
+        beta2: 0.999,
+        eps: 1e-8,
+        weight_decay: 0.01,
+    };
+    
+    let mut optimizer = AdamW::new(varmap.all_vars(), adamw_params)
+        .map_err(|e| format!("Erreur optimizer: {}", e))?;
+    
+    let _ = app.emit("log", serde_json::json!({
+        "level": "info",
+        "message": format!("   {} epochs, lr={:.6}, beta1={}", config.epochs, effective_lr, beta1)
+    }));
+    
+    // Training loop
+    for epoch in 0..config.epochs {
+        let mut epoch_loss = 0.0f32;
+        let mut batch_count = 0;
+        
+        for batch_idx in 0..batches_per_epoch {
+            let start_idx = (batch_idx * batch_size) % num_sequences;
+            let mut batch_tokens: Vec<u32> = Vec::new();
+            let mut batch_targets: Vec<u32> = Vec::new();
+            
+            for i in 0..batch_size {
+                let seq_idx = (start_idx + i) % num_sequences;
+                let seq = &tokenized[seq_idx];
+                let mut padded: Vec<u32> = seq.clone();
+                while padded.len() < seq_len { padded.push(0); }
+                
+                for j in 0..(seq_len - 1) {
+                    batch_tokens.push(padded[j].min(vocab_size as u32 - 1));
+                    batch_targets.push(padded[j + 1].min(vocab_size as u32 - 1));
+                }
+            }
+            
+            let actual_seq_len = seq_len - 1;
+            let total_tokens = batch_size * actual_seq_len;
+            
+            let input_ids = Tensor::from_vec(batch_tokens, (batch_size, actual_seq_len), device)
+                .map_err(|e| format!("Erreur input: {}", e))?;
+            let target_ids = Tensor::from_vec(batch_targets, (total_tokens,), device)
+                .map_err(|e| format!("Erreur target: {}", e))?;
+            
+            let logits = model.forward(&input_ids, None)
+                .map_err(|e| format!("Erreur forward: {}", e))?;
+            
+            let logits = logits.flatten(0, 1)
+                .map_err(|e| format!("Erreur flatten: {}", e))?;
+            
+            let loss = cross_entropy(&logits, &target_ids)
+                .map_err(|e| format!("Erreur cross_entropy: {}", e))?;
+            let batch_loss: f32 = loss.to_scalar()
+                .map_err(|e| format!("Erreur scalar: {}", e))?;
+            
+            epoch_loss += batch_loss;
+            batch_count += 1;
+            
+            optimizer.backward_step(&loss)
+                .map_err(|e| format!("Erreur backward: {}", e))?;
+        }
+        
+        let loss = epoch_loss / batch_count.max(1) as f32;
+        loss_history.push(loss);
+        if loss < best_loss { best_loss = loss; }
+        
+        let perplexity = loss.exp();
+        
+        let _ = app.emit("benchmark-progress", serde_json::json!({
+            "optimizer": optimizer_name.to_lowercase(),
+            "status": "running",
+            "epoch": epoch + 1,
+            "loss": loss,
+            "perplexity": perplexity
+        }));
+        
+        let _ = app.emit("log", serde_json::json!({
+            "level": "info",
+            "message": format!("   {} - Epoch {}/{}: loss={:.4} | ppl={:.2}", 
+                optimizer_name, epoch + 1, config.epochs, loss, perplexity)
+        }));
+    }
+    
+    let training_time = start_time.elapsed().as_millis() as u64;
+    let final_loss = *loss_history.last().unwrap_or(&0.0);
+    
+    let _ = app.emit("log", serde_json::json!({
+        "level": "success",
+        "message": format!("✅ {} terminé: loss={:.4} | temps={:.1}s", 
+            optimizer_name, final_loss, training_time as f64 / 1000.0)
+    }));
+    
+    Ok(BenchmarkResult {
+        optimizer: optimizer_name.to_string(),
+        final_loss,
+        best_loss,
+        training_time_ms: training_time,
+        loss_history,
+        memory_peak_mb: 2000.0,
+        convergence_epoch: None,
+    })
+}
+
 /// Lance le TRAINING de VesperLM avec Velvet optimizer
 #[tauri::command]
 pub async fn start_benchmark(
@@ -942,13 +1096,16 @@ pub async fn start_benchmark(
     _state: State<'_, AppState>,
 ) -> Result<BenchmarkComparison, String> {
     use tauri::Emitter;
-    use candle_core::{Device, Tensor, DType};
-    use candle_nn::{loss::cross_entropy, VarMap, VarBuilder, Optimizer, optim::AdamW, ParamsAdamW};
-    use std::time::Instant;
+    use candle_core::Device;
     
     let _ = app.emit("log", serde_json::json!({
         "level": "info",
         "message": "🚀 Démarrage du training VesperLM..."
+    }));
+    
+    let _ = app.emit("log", serde_json::json!({
+        "level": "info",
+        "message": format!("🔧 Optimizers sélectionnés: {}", config.optimizers.join(", "))
     }));
     
     // ========== CACHE BINAIRE MEMORY-MAPPED ==========
@@ -1106,192 +1263,74 @@ pub async fn start_benchmark(
             config.velvet_lr_multiplier, config.velvet_beta1, config.era_temperature)
     }));
     
-    // ========== VESPERLM COMPLET - TRANSFORMER AVEC ATTENTION + FLYLORA + ERA ==========
-    let start_time = Instant::now();
-    let mut loss_history = Vec::new();
-    let mut best_loss = f32::MAX;
-    let num_sequences = tokenized.len();
-    let batches_per_epoch = (num_sequences / batch_size).max(1).min(20);
-    
-    let varmap = VarMap::new();
-    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    
     // Config VesperLM avec vocab adapté
     let mut vesper_config = base_vesper_config.clone();
     vesper_config.vocab_size = vocab_size;
     
-    let _ = app.emit("log", serde_json::json!({
-        "level": "info",
-        "message": format!("🏗️ Création VesperLM COMPLET: {} layers, {} heads, {} hidden", 
-            vesper_config.num_layers, vesper_config.num_heads, vesper_config.hidden_size)
-    }));
-    
-    let _ = app.emit("log", serde_json::json!({
-        "level": "info",
-        "message": format!("   FlyLoRA: rank={}, sparsity={:.0}%", 
-            vesper_config.flylora_rank, vesper_config.flylora_sparsity * 100.0)
-    }));
-    
-    let _ = app.emit("log", serde_json::json!({
-        "level": "info",
-        "message": format!("   ERA: temp={}, entropy_weight={}", 
-            vesper_config.era_temperature, vesper_config.era_entropy_weight)
-    }));
-    
-    // Créer le modèle VesperLM complet
-    let model = VesperLM::new(vesper_config.clone(), vb)
-        .map_err(|e| format!("Erreur création VesperLM: {}", e))?;
-    
     let total_params = vesper_config.total_params();
     let _ = app.emit("log", serde_json::json!({
         "level": "success",
-        "message": format!("✅ VesperLM créé: {}M params", total_params / 1_000_000)
+        "message": format!("✅ VesperLM config: {}M params", total_params / 1_000_000)
     }));
     
-    // Optimizer Velvet (AdamW avec params optimisés)
-    let effective_lr = lr * config.velvet_lr_multiplier as f32;
-    let adamw_params = ParamsAdamW {
-        lr: effective_lr as f64,
-        beta1: config.velvet_beta1,
-        beta2: 0.999,
-        eps: 1e-8,
-        weight_decay: 0.01,
+    // ========== LANCER LES TRAININGS POUR CHAQUE OPTIMIZER ==========
+    let mut results = Vec::new();
+    
+    for optimizer_name in &config.optimizers {
+        let result = train_with_optimizer(
+            &app,
+            optimizer_name,
+            &config,
+            &tokenized,
+            &device,
+            &vesper_config,
+            vocab_size,
+            seq_len,
+            batch_size,
+            lr,
+        ).await?;
+        
+        results.push(result);
+    }
+    
+    // ========== COMPARER LES RÉSULTATS ==========
+    if results.len() == 1 {
+        let winner = results[0].optimizer.clone();
+        let summary = format!("Training {} terminé avec succès", winner);
+        return Ok(BenchmarkComparison {
+            results,
+            winner,
+            improvement_percent: 0.0,
+            summary,
+        });
+    }
+    
+    // Trouver le meilleur optimizer (plus petite loss finale)
+    let best_idx = results.iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.final_loss.partial_cmp(&b.final_loss).unwrap())
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    
+    let winner = results[best_idx].optimizer.clone();
+    let best_loss = results[best_idx].final_loss;
+    
+    // Calculer l'amélioration par rapport à l'autre
+    let other_loss = if best_idx == 0 {
+        results.get(1).map(|r| r.final_loss).unwrap_or(best_loss)
+    } else {
+        results.get(0).map(|r| r.final_loss).unwrap_or(best_loss)
     };
     
-    let mut optimizer = AdamW::new(varmap.all_vars(), adamw_params)
-        .map_err(|e| format!("Erreur optimizer: {}", e))?;
-    
-    let _ = app.emit("log", serde_json::json!({
-        "level": "info",
-        "message": format!("🚀 Training VesperLM: {} epochs, batch={}, lr={:.6}", config.epochs, batch_size, effective_lr)
-    }));
-    
-    // ========== TRAINING LOOP ==========
-    for epoch in 0..config.epochs {
-        let mut epoch_loss = 0.0f32;
-        let mut batch_count = 0;
-        
-        for batch_idx in 0..batches_per_epoch {
-            let start_idx = (batch_idx * batch_size) % num_sequences;
-            let mut batch_tokens: Vec<u32> = Vec::new();
-            let mut batch_targets: Vec<u32> = Vec::new();
-            
-            for i in 0..batch_size {
-                let seq_idx = (start_idx + i) % num_sequences;
-                let seq = &tokenized[seq_idx];
-                let mut padded: Vec<u32> = seq.clone();
-                while padded.len() < seq_len { padded.push(0); }
-                
-                for j in 0..(seq_len - 1) {
-                    batch_tokens.push(padded[j].min(vocab_size as u32 - 1));
-                    batch_targets.push(padded[j + 1].min(vocab_size as u32 - 1));
-                }
-            }
-            
-            let actual_seq_len = seq_len - 1;
-            let total_tokens = batch_size * actual_seq_len;
-            
-            let input_ids = Tensor::from_vec(batch_tokens, (batch_size, actual_seq_len), &device)
-                .map_err(|e| format!("Erreur input: {}", e))?;
-            let target_ids = Tensor::from_vec(batch_targets, (total_tokens,), &device)
-                .map_err(|e| format!("Erreur target: {}", e))?;
-            
-            // Forward pass VesperLM complet (embedding -> attention layers -> lm_head)
-            let logits = model.forward(&input_ids, None)
-                .map_err(|e| format!("Erreur forward VesperLM: {}", e))?;
-            
-            // Reshape pour cross_entropy
-            let logits = logits.flatten(0, 1)
-                .map_err(|e| format!("Erreur flatten: {}", e))?;
-            
-            // Loss + backward
-            let loss = cross_entropy(&logits, &target_ids)
-                .map_err(|e| format!("Erreur cross_entropy: {}", e))?;
-            let batch_loss: f32 = loss.to_scalar()
-                .map_err(|e| format!("Erreur scalar: {}", e))?;
-            
-            epoch_loss += batch_loss;
-            batch_count += 1;
-            
-            optimizer.backward_step(&loss)
-                .map_err(|e| format!("Erreur backward: {}", e))?;
-        }
-        
-        let loss = epoch_loss / batch_count.max(1) as f32;
-        loss_history.push(loss);
-        if loss < best_loss { best_loss = loss; }
-        
-        let perplexity = loss.exp();
-        
-        let _ = app.emit("benchmark-progress", serde_json::json!({
-            "optimizer": "velvet",
-            "status": "running",
-            "epoch": epoch + 1,
-            "loss": loss,
-            "perplexity": perplexity
-        }));
-        
-        let _ = app.emit("log", serde_json::json!({
-            "level": "info",
-            "message": format!("📈 Epoch {}/{}: loss={:.4} | ppl={:.2}", epoch + 1, config.epochs, loss, perplexity)
-        }));
-    }
-    
-    let training_time = start_time.elapsed().as_millis() as u64;
-    let final_loss = *loss_history.last().unwrap_or(&0.0);
-    
-    let _ = app.emit("log", serde_json::json!({
-        "level": "success",
-        "message": format!("🎉 Training VesperLM terminé: loss={:.4} | temps={}ms", final_loss, training_time)
-    }));
-    
-    // ========== SAUVEGARDE DU MODÈLE COMPLET ==========
-    let models_dir = dirs::document_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("VesperAI")
-        .join("models");
-    std::fs::create_dir_all(&models_dir).ok();
-    
-    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let filename = format!("vesper_{}_{}.safetensors", config.model_size.to_lowercase(), timestamp);
-    let filepath = models_dir.join(&filename);
-    
-    // Sauvegarder tous les poids du modèle
-    match varmap.save(&filepath) {
-        Ok(_) => {
-            let file_size = std::fs::metadata(&filepath)
-                .map(|m| m.len() as f64 / 1_000_000.0)
-                .unwrap_or(0.0);
-            let _ = app.emit("log", serde_json::json!({
-                "level": "success",
-                "message": format!("💾 VesperLM sauvegardé: {} ({:.1}MB)", filename, file_size)
-            }));
-        }
-        Err(e) => {
-            let _ = app.emit("log", serde_json::json!({
-                "level": "error",
-                "message": format!("❌ Erreur sauvegarde: {}", e)
-            }));
-        }
-    }
-    
-    // Résultat compatible avec l'ancien format
-    let results = vec![BenchmarkResult {
-        optimizer: "VELVET".to_string(),
-        final_loss,
-        best_loss,
-        training_time_ms: training_time,
-        loss_history: loss_history.clone(),
-        memory_peak_mb: 2000.0,
-        convergence_epoch: None,
-    }];
-    
-    let winner = "VELVET".to_string();
-    let improvement = 0.0;
+    let improvement_percent = if other_loss > 0.0 {
+        ((other_loss - best_loss) / other_loss * 100.0).abs()
+    } else {
+        0.0
+    };
     
     let summary = format!(
-        "🏆 {} gagne avec {:.1}% de loss en moins",
-        winner, improvement
+        "🏆 {} gagne avec {:.1}% de loss en moins ({:.4} vs {:.4})",
+        winner, improvement_percent, best_loss, other_loss
     );
     
     let _ = app.emit("log", serde_json::json!({
@@ -1302,7 +1341,7 @@ pub async fn start_benchmark(
     Ok(BenchmarkComparison {
         results,
         winner,
-        improvement_percent: improvement,
+        improvement_percent,
         summary,
     })
 }

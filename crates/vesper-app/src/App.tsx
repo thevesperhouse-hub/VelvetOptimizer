@@ -62,6 +62,7 @@ function App() {
   const [epochs, setEpochs] = useState(3)
   const [datasetPath, setDatasetPath] = useState('')
   const [modelConfigs, setModelConfigs] = useState<ModelConfig[]>([])
+  const [selectedOptimizer, setSelectedOptimizer] = useState<'velvet' | 'adamw'>('velvet')
   
   // New states
   const [datasetSource, setDatasetSource] = useState<DatasetSource>('local')
@@ -211,7 +212,7 @@ function App() {
           epochs: epochs,
           batch_size: 8,
           learning_rate: 0.0001,
-          optimizers: ['velvet'],
+          optimizers: [selectedOptimizer], // Utilise l'optimizer sélectionné
           velvet_lr_multiplier: advancedConfig.velvet_lr_multiplier,
           velvet_beta1: advancedConfig.velvet_beta1,
           era_temperature: advancedConfig.era_temperature,
@@ -274,12 +275,20 @@ function App() {
     }
   }
 
-  // Benchmark - reçoit les résultats directement
+  // Benchmark - Lance AdamW puis Velvet séquentiellement
   const runBenchmark = async () => {
     if (!datasetPath) return
     setBenchmarkRunning(true)
     setBenchmarkResults(null)
+    
+    setLogs(prev => [...prev, {
+      time: new Date().toLocaleTimeString('fr-FR'),
+      level: 'info',
+      message: '🔬 Démarrage du benchmark: AdamW vs Velvet'
+    }])
+    
     try {
+      // Lancer les deux optimizers séquentiellement : AdamW d'abord, puis Velvet
       const results = await invoke<BenchmarkComparison>('start_benchmark', {
         config: {
           dataset_path: datasetPath,
@@ -287,7 +296,7 @@ function App() {
           epochs: epochs,
           batch_size: 8,
           learning_rate: 0.0001,
-          optimizers: ['velvet', 'adamw'],
+          optimizers: ['adamw', 'velvet'], // Ordre important : AdamW puis Velvet
           // Paramètres avancés
           velvet_lr_multiplier: advancedConfig.velvet_lr_multiplier,
           velvet_beta1: advancedConfig.velvet_beta1,
@@ -297,6 +306,12 @@ function App() {
         }
       })
       setBenchmarkResults(results)
+      
+      setLogs(prev => [...prev, {
+        time: new Date().toLocaleTimeString('fr-FR'),
+        level: 'success',
+        message: `✅ Benchmark terminé! Gagnant: ${results.winner} (${results.improvement_percent.toFixed(1)}% mieux)`
+      }])
     } catch (error) {
       console.error('Benchmark failed:', error)
       // Afficher l'erreur dans les logs
@@ -537,6 +552,18 @@ function App() {
                     className="w-full bg-white/5 rounded-xl px-4 py-3 border border-white/10 focus:outline-none focus:border-orange-500/50 transition-colors text-sm"
                   />
                 </div>
+                
+                <div>
+                  <label className="block mb-2 text-xs text-white/50">Optimizer</label>
+                  <select
+                    value={selectedOptimizer}
+                    onChange={(e) => setSelectedOptimizer(e.target.value as 'velvet' | 'adamw')}
+                    className="w-full bg-white/5 rounded-xl px-4 py-3 border border-white/10 focus:outline-none focus:border-orange-500/50 transition-colors text-sm"
+                  >
+                    <option value="velvet" className="bg-black">Velvet (Custom)</option>
+                    <option value="adamw" className="bg-black">AdamW (Baseline)</option>
+                  </select>
+                </div>
               </div>
             </SpotlightCard>
           </div>
@@ -611,7 +638,7 @@ function App() {
                 <SpotlightCard className="p-5" spotlightColor="rgba(236, 72, 153, 0.15)">
                   <div className="text-xs text-white/40 mb-1">Optimizer</div>
                   <div className="text-3xl font-bold bg-gradient-to-r from-pink-400 to-orange-400 text-transparent bg-clip-text">
-                    Velvet
+                    {selectedOptimizer === 'velvet' ? 'Velvet' : 'AdamW'}
                   </div>
                 </SpotlightCard>
               </div>
