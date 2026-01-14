@@ -1,0 +1,25 @@
+[package]
+name = "vesper-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
+candle-transformers.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+
+# Memory mapping pour dataset binaire
+memmap2 = "0.9"
+bytemuck = { version = "1.14", features = ["derive"] }
+
+[dev-dependencies]
+approx = "0.5"

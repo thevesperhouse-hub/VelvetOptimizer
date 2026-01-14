@@ -1,0 +1,15 @@
+[package]
+name = "vesper-metacog"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
+vesper-core = { path = "../vesper-core" }
+
+serde.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true

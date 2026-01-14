@@ -1,0 +1,23 @@
+{
+  "velvet": {
+    "lr_multiplier": 1.5,
+    "beta1": 0.95,
+    "beta2": 0.999,
+    "weight_decay": 0.01
+  },
+  "era": {
+    "temperature": 1.0,
+    "entropy_threshold": 0.5
+  },
+  "flylora": {
+    "rank": 16,
+    "sparsity": 0.75
+  },
+  "training": {
+    "learning_rate": 0.001,
+    "epochs": 10,
+    "batch_size": 8,
+    "seq_len": 64,
+    "model_size": "Medium"
+  }
+}

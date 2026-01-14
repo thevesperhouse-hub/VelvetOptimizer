@@ -1,0 +1,41 @@
+[build-system]
+requires = [
+    "setuptools>=42",
+    "wheel",
+    "torch>=1.9.0",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "velvet-optimizer"
+version = "1.0.0"
+description = "High-performance GPU optimizer for PyTorch with custom CUDA kernels"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "MIT"}
+authors = [
+    {name = "The Vesper House"}
+]
+keywords = ["pytorch", "optimizer", "cuda", "gpu", "deep-learning", "machine-learning", "adam"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=1.9.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/thevesperhouse-hub/Velvet"
+"Bug Reports" = "https://github.com/thevesperhouse-hub/Velvet/issues"
+Source = "https://github.com/thevesperhouse-hub/Velvet"
