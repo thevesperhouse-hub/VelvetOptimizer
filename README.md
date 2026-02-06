@@ -1,6 +1,6 @@
 # 🔥 VesperAI - Rust Edition
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Proprietary](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.83+-orange.svg)](https://www.rust-lang.org/)
 [![CUDA](https://img.shields.io/badge/CUDA-12.8-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 [![Candle](https://img.shields.io/badge/Candle-0.9.1-blue.svg)](https://github.com/huggingface/candle)
@@ -679,7 +679,7 @@ Avec un petit dataset (37k tokens), le modèle atteint une perplexité très bas
 
 ## 📄 License
 
-MIT License - voir [LICENSE](LICENSE)
+Proprietary - The Vesper House. All rights reserved. See [LICENSE](LICENSE).
 
 ---
 
