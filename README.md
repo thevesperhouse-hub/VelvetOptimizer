@@ -525,9 +525,9 @@ The benchmark uses **real training with autograd** via `candle-nn`:
 ## Benchmarks & Results
 
 ### Test Configuration
-- **GPU**: NVIDIA RTX 4080 (87% GPU utilization achieved)
+- **GPU**: NVIDIA RTX 4080 Laptop (12GB VRAM, 87% GPU utilization achieved)
 - **CPU**: Intel i9-13900K
-- **RAM**: 64GB DDR5
+- **RAM**: 32GB DDR5
 - **Dataset**: TinyStories (~37k tokens)
 
 ### VesperLM Model Sizes
