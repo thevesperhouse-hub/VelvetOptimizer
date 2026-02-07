@@ -100,9 +100,15 @@ impl MoELayer {
     }
 
     /// Forward pass: route tokens to top-K experts, return (output, aux_loss).
+    ///
+    /// Optimized token-dispatch: each expert only processes tokens actually
+    /// routed to it (via index_select), then results are scattered back.
+    /// With top_k=2 and N=4 experts, this halves expert compute vs the naive
+    /// approach of running every expert on all tokens.
     pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
-        let (batch_size, seq_len, _hidden) = x.dims3()?;
+        let (batch_size, seq_len, hidden) = x.dims3()?;
         let device = x.device();
+        let num_tokens = batch_size * seq_len;
 
         // 1. Router: softmax over expert logits
         let router_logits = self.router.forward(x)?; // [B, S, N]
@@ -118,36 +124,63 @@ impl MoELayer {
         let normalizer = top_k_probs.sum_keepdim(2)?;
         let top_k_weights = top_k_probs.broadcast_div(&normalizer)?; // [B, S, K]
 
-        // 3. Compute weighted expert outputs
-        let mut output = Tensor::zeros_like(x)?;
+        // 3. Flatten to token-level for dispatch
+        let x_flat = x.reshape((num_tokens, hidden))?; // [T, H]
+        let tk_idx_flat = top_k_indices.reshape((num_tokens, self.top_k))?; // [T, K]
+        let tk_w_flat = top_k_weights.reshape((num_tokens, self.top_k))?; // [T, K]
+
+        // Single CPU sync: read routing decisions for token-level dispatch
+        let indices_cpu = tk_idx_flat.to_vec2::<u32>()?;
+        let weights_cpu = tk_w_flat.to_vec2::<f32>()?;
+
+        // 4. Build per-expert token lists (CPU, fast — ~4K entries)
+        let mut expert_token_ids: Vec<Vec<u32>> = vec![Vec::new(); self.num_experts];
+        let mut expert_token_weights: Vec<Vec<f32>> = vec![Vec::new(); self.num_experts];
+
+        for t in 0..num_tokens {
+            for k in 0..self.top_k {
+                let eid = indices_cpu[t][k] as usize;
+                expert_token_ids[eid].push(t as u32);
+                expert_token_weights[eid].push(weights_cpu[t][k]);
+            }
+        }
+
+        // 5. Run each expert on ONLY its assigned tokens, scatter results back
+        let mut output_flat = Tensor::zeros((num_tokens, hidden), DType::F32, device)?;
 
         for expert_id in 0..self.num_experts {
-            // Build combined weight for this expert across all K slots
-            let mut expert_weight = Tensor::zeros((batch_size, seq_len), DType::F32, device)?;
-            for k in 0..self.top_k {
-                let idx_k = top_k_indices.narrow(2, k, 1)?.squeeze(2)?; // [B, S] U32
-                let w_k = top_k_weights.narrow(2, k, 1)?.squeeze(2)?; // [B, S] F32
-
-                // Mask: 1 where this token selected expert_id at slot k
-                let mask = idx_k.eq(expert_id as u32)?.to_dtype(DType::F32)?; // [B, S]
-                expert_weight = (expert_weight + mask.mul(&w_k)?)?;
-            }
-
-            // Skip expert if no tokens routed to it
-            let weight_sum = expert_weight.sum_all()?.to_scalar::<f32>()?;
-            if weight_sum < 1e-6 {
+            let n_sel = expert_token_ids[expert_id].len();
+            if n_sel == 0 {
                 continue;
             }
 
-            // Run expert and weight its output
-            let expert_out = self.experts[expert_id].forward(x)?; // [B, S, H]
-            let w_expanded = expert_weight
-                .unsqueeze(2)?
-                .broadcast_as(expert_out.shape())?; // [B, S, H]
-            output = (output + expert_out.mul(&w_expanded)?)?;
+            // Index-select only the tokens routed to this expert
+            let idx = Tensor::from_vec(
+                expert_token_ids[expert_id].clone(), n_sel, device,
+            )?;
+            let x_expert = x_flat.index_select(&idx, 0)?; // [n_sel, H]
+
+            // Run expert forward on subset only
+            let expert_out = self.experts[expert_id].forward(&x_expert)?; // [n_sel, H]
+
+            // Weight outputs
+            let w = Tensor::from_vec(
+                expert_token_weights[expert_id].clone(), n_sel, device,
+            )?;
+            let w_exp = w.unsqueeze(1)?.broadcast_as(expert_out.shape())?;
+            let weighted = expert_out.mul(&w_exp)?; // [n_sel, H]
+
+            // Scatter-add weighted results back into output
+            let scatter_idx = idx
+                .unsqueeze(1)?
+                .broadcast_as(weighted.shape())?
+                .contiguous()?;
+            output_flat = output_flat.scatter_add(&scatter_idx, &weighted, 0)?;
         }
 
-        // 4. Load balancing auxiliary loss
+        let output = output_flat.reshape((batch_size, seq_len, hidden))?;
+
+        // 6. Load balancing auxiliary loss
         let aux_loss = self.load_balancing_loss(&router_probs, &top_k_indices)?;
 
         Ok((output, aux_loss))
