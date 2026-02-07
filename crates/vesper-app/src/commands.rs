@@ -814,8 +814,8 @@ pub struct BenchmarkConfig {
     pub velvet_lr_multiplier: f64,
     #[serde(default = "default_beta1")]
     pub velvet_beta1: f64,
-    #[serde(default = "default_era_temp")]
-    pub era_temperature: f64,
+    #[serde(default = "default_era_gamma")]
+    pub era_gamma: f64,
     #[serde(default = "default_flylora_rank")]
     pub flylora_rank: usize,
     #[serde(default = "default_flylora_sparsity")]
@@ -824,7 +824,7 @@ pub struct BenchmarkConfig {
 
 fn default_lr_mult() -> f64 { 1.5 }
 fn default_beta1() -> f64 { 0.95 }
-fn default_era_temp() -> f64 { 1.0 }
+fn default_era_gamma() -> f64 { 0.1 }
 fn default_flylora_rank() -> usize { 16 }
 fn default_flylora_sparsity() -> f64 { 0.75 }
 
@@ -1260,8 +1260,8 @@ pub async fn start_benchmark(
     
     let _ = app.emit("log", serde_json::json!({
         "level": "info",
-        "message": format!("🔧 Advanced: velvet_lr={}x, beta1={}, era_temp={}", 
-            config.velvet_lr_multiplier, config.velvet_beta1, config.era_temperature)
+        "message": format!("🔧 Advanced: velvet_lr={}x, beta1={}, era_gamma={}",
+            config.velvet_lr_multiplier, config.velvet_beta1, config.era_gamma)
     }));
     
     // Config VesperLM avec vocab adapté

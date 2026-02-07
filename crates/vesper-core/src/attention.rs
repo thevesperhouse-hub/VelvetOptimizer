@@ -145,7 +145,7 @@ impl MultiHeadAttention {
         
         for i in 0..seq_len {
             for j in (i + 1)..seq_len {
-                mask_data[i * seq_len + j] = f32::NEG_INFINITY;
+                mask_data[i * seq_len + j] = -1e9;
             }
         }
 

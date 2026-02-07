@@ -60,9 +60,40 @@ impl VesperLM {
     pub fn forward(&self, input_ids: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
         let mut hidden_states = self.embeddings.forward(input_ids)?;
 
+        // Convert 2D attention mask [batch, seq] to 4D causal mask [batch, 1, seq, seq]
+        let mask_4d = if let Some(mask) = attention_mask {
+            let dims = mask.dims();
+            if dims.len() == 2 {
+                let (batch_size, seq_len) = (dims[0], dims[1]);
+                // Create causal mask
+                let mut causal_data = vec![0.0f32; seq_len * seq_len];
+                for i in 0..seq_len {
+                    for j in (i + 1)..seq_len {
+                        causal_data[i * seq_len + j] = -1e9;
+                    }
+                }
+                let causal = Tensor::from_vec(causal_data, (1, 1, seq_len, seq_len), mask.device())?;
+
+                // Convert padding mask: [batch, seq] -> [batch, 1, 1, seq]
+                // 0 in mask -> -1e9, 1 in mask -> 0 (using -1e9 instead of -inf to avoid 0*-inf=NaN)
+                let padding_mask = mask.to_dtype(candle_core::DType::F32)?;
+                let ones = Tensor::ones_like(&padding_mask)?;
+                let padding_mask = (ones.sub(&padding_mask)? * (-1e9 as f64))?;
+                let padding_mask = padding_mask.unsqueeze(1)?.unsqueeze(1)?;
+
+                // Combine: causal + padding
+                let combined = causal.broadcast_add(&padding_mask)?;
+                Some(combined)
+            } else {
+                Some(mask.clone())
+            }
+        } else {
+            None
+        };
+
         // Pass through transformer layers
         for layer in &self.layers {
-            hidden_states = layer.forward(&hidden_states, attention_mask)?;
+            hidden_states = layer.forward(&hidden_states, mask_4d.as_ref())?;
         }
 
         // Final layer norm
@@ -163,8 +194,7 @@ impl FeedForward {
         )?;
 
         let era = ERAActivation::new(crate::era::ERAConfig {
-            temperature: config.era_temperature,
-            entropy_weight: config.era_entropy_weight,
+            gamma: config.era_gamma,
         });
 
         Ok(Self {

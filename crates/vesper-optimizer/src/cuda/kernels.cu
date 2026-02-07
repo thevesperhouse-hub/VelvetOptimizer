@@ -102,6 +102,7 @@ extern "C" void velvet_complete_update_cuda(
         perplexity_guided, ppl_momentum_scale,
         sparse_aware
     );
-    
-    cudaDeviceSynchronize();
+
+    // No cudaDeviceSynchronize: CUDA stream ordering guarantees kernel
+    // serialization. Sync only needed when CPU reads results (e.g. to_scalar).
 }

@@ -4,6 +4,7 @@
 //! Utilise les kernels CUDA custom quand disponible
 
 use candle_core::{Device, Result, Tensor};
+use candle_nn::VarMap;
 use std::collections::HashMap;
 
 #[cfg(feature = "cuda")]
@@ -19,6 +20,8 @@ pub struct VelvetConfig {
     pub entropy_adaptive: bool,
     pub perplexity_guided: bool,
     pub sparse_aware: bool,
+    /// Max gradient norm for clipping. 0.0 = disabled.
+    pub max_grad_norm: f64,
 }
 
 impl Default for VelvetConfig {
@@ -32,6 +35,7 @@ impl Default for VelvetConfig {
             entropy_adaptive: false,
             perplexity_guided: false,
             sparse_aware: false,
+            max_grad_norm: 1.0,
         }
     }
 }
@@ -48,6 +52,7 @@ impl VelvetConfig {
             entropy_adaptive: true,
             perplexity_guided: true,
             sparse_aware: true,
+            max_grad_norm: 1.0,
         }
     }
 }
@@ -57,7 +62,8 @@ pub struct VelvetOptimizer {
     step: usize,
     entropy_scale: f64,
     perplexity_scale: f64,
-    
+    last_grad_norm: f64,
+
     // State for each parameter
     state: HashMap<String, OptimizerState>,
 }
@@ -75,6 +81,7 @@ impl VelvetOptimizer {
             step: 0,
             entropy_scale: 1.0,
             perplexity_scale: 1.0,
+            last_grad_norm: 0.0,
             state: HashMap::new(),
         }
     }
@@ -178,6 +185,60 @@ impl VelvetOptimizer {
         Ok(())
     }
 
+    /// Single-call backward + step, like AdamW's backward_step.
+    /// Includes gradient clipping when max_grad_norm > 0.
+    /// GPU-optimized: accumulates norm on GPU, only 1 CPU sync for the total.
+    pub fn backward_step(&mut self, loss: &Tensor, varmap: &VarMap) -> Result<()> {
+        self.step += 1;
+        let grad_store = loss.backward()?;
+        let data = varmap.data().lock().unwrap();
+
+        // Pass 1: compute global gradient norm on GPU (1 sync total)
+        let clip_coef = if self.config.max_grad_norm > 0.0 {
+            let mut total_norm_sq: Option<Tensor> = None;
+            for (_name, var) in data.iter() {
+                if let Some(grad) = grad_store.get(var.as_tensor()) {
+                    let sq_sum = grad.sqr()?.sum_all()?;
+                    total_norm_sq = Some(match total_norm_sq {
+                        Some(acc) => acc.add(&sq_sum)?,
+                        None => sq_sum,
+                    });
+                }
+            }
+            let global_norm = match &total_norm_sq {
+                Some(t) => (t.to_scalar::<f32>()? as f64).sqrt(),
+                None => 0.0,
+            };
+            self.last_grad_norm = global_norm;
+
+            if global_norm > self.config.max_grad_norm {
+                self.config.max_grad_norm / (global_norm + 1e-6)
+            } else {
+                1.0
+            }
+        } else {
+            self.last_grad_norm = 0.0;
+            1.0
+        };
+
+        // Pass 2: apply updates with clipped gradients
+        for (name, var) in data.iter() {
+            if let Some(grad) = grad_store.get(var.as_tensor()) {
+                let grad = if clip_coef < 1.0 {
+                    (grad.clone() * clip_coef)?
+                } else {
+                    grad.clone()
+                };
+                let mut param_tensor = var.as_tensor().detach();
+                self.update_param(name, &mut param_tensor, &grad)?;
+                // On CUDA: kernel updated shared storage in-place, set() is no-op
+                // On CPU: optimizer created new tensor, set() writes it back
+                let _ = var.set(&param_tensor);
+            }
+        }
+        Ok(())
+    }
+
     pub fn set_entropy_scale(&mut self, scale: f64) {
         self.entropy_scale = scale;
     }
@@ -192,6 +253,10 @@ impl VelvetOptimizer {
 
     pub fn get_lr(&self) -> f64 {
         self.config.lr
+    }
+
+    pub fn last_grad_norm(&self) -> f64 {
+        self.last_grad_norm
     }
 }
 

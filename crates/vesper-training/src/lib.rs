@@ -7,7 +7,7 @@ pub mod dataset;
 pub mod trainer;
 
 pub use auto_scale::{AutoScaler, ScalingResult};
-pub use dataset::{Dataset, DatasetLoader};
+pub use dataset::{Dataset, DatasetLoader, Sample, StreamingTextLoader};
 pub use trainer::{Trainer, TrainerConfig};
 
 

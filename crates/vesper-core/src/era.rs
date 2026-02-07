@@ -1,21 +1,24 @@
 //! ERA Activation - Entropy-Regularized Activation
-//! 
-//! Custom activation combining SiLU with entropy regularization
+//!
+//! ERA(x) = GELU(x) + γ * softplus(x)
+//! where softplus(x) = log(1 + exp(x))
+//!
+//! The additive softplus term prevents dead neurons by ensuring
+//! a small positive baseline activation, acting as implicit
+//! entropy regularization on the hidden representations.
 
 use candle_core::{Result, Tensor};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ERAConfig {
-    pub temperature: f64,
-    pub entropy_weight: f64,
+    pub gamma: f64,
 }
 
 impl Default for ERAConfig {
     fn default() -> Self {
         Self {
-            temperature: 0.1,
-            entropy_weight: 0.01,
+            gamma: 0.1,
         }
     }
 }
@@ -29,41 +32,16 @@ impl ERAActivation {
         Self { config }
     }
 
-    /// Forward pass: ERA(x) = x * sigmoid(x) * (1 - entropy_penalty)
+    /// Forward pass: ERA(x) = GELU(x) + γ * softplus(x)
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // SiLU/Swish: x * sigmoid(x)
-        let sigmoid_x = candle_nn::ops::sigmoid(x)?;
-        let silu = x.mul(&sigmoid_x)?;
+        let gelu_x = gelu(x)?;
 
-        // Calculate entropy penalty if weight > 0
-        if self.config.entropy_weight > 0.0 {
-            let entropy_penalty = self.calculate_entropy_penalty(x)?;
-            let one_minus_penalty = (1.0 - entropy_penalty)?;
-            silu.broadcast_mul(&one_minus_penalty)
+        if self.config.gamma > 0.0 {
+            let sp = softplus(x)?;
+            gelu_x + (sp * self.config.gamma)?
         } else {
-            Ok(silu)
+            Ok(gelu_x)
         }
-    }
-
-    /// Calculate entropy-based regularization
-    fn calculate_entropy_penalty(&self, x: &Tensor) -> Result<Tensor> {
-        // Softmax over last dimension
-        let temp_scaled = (x / self.config.temperature)?;
-        let probs = candle_nn::ops::softmax(&temp_scaled, x.dims().len() - 1)?;
-
-        // Entropy: -sum(p * log(p)) with epsilon to avoid log(0)
-        let eps = 1e-10;
-        let probs_safe = (probs.clone() + eps)?;
-        let log_probs = probs_safe.log()?;
-        let entropy = (probs.mul(&log_probs)?.sum_keepdim(x.dims().len() - 1)? * -1.0)?;
-
-        // Normalize to [0, 1] range
-        let max_entropy = (x.dims()[x.dims().len() - 1] as f64).ln();
-        let normalized_entropy = (entropy / max_entropy)?;
-
-        // Scale by weight and clamp to avoid NaN
-        let penalty = (normalized_entropy * self.config.entropy_weight)?;
-        penalty.clamp(0.0, 1.0)
     }
 
     pub fn config(&self) -> &ERAConfig {
@@ -71,16 +49,30 @@ impl ERAActivation {
     }
 }
 
-/// Simplified ERA for inference (no entropy penalty)
+/// GELU activation (tanh approximation):
+/// 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+fn gelu(x: &Tensor) -> Result<Tensor> {
+    let coeff = (2.0_f64 / std::f64::consts::PI).sqrt();
+    let x_cubed = x.mul(&x.mul(x)?)?;
+    let inner = ((x + (x_cubed * 0.044715)?)? * coeff)?;
+    let tanh_inner = inner.tanh()?;
+    (x * 0.5)?.mul(&(tanh_inner + 1.0)?)
+}
+
+/// Softplus: log(1 + exp(x))
+fn softplus(x: &Tensor) -> Result<Tensor> {
+    (x.exp()? + 1.0)?.log()
+}
+
+/// Simplified ERA for inference (just GELU, no entropy regularization)
 pub fn era_simple(x: &Tensor) -> Result<Tensor> {
-    let sigmoid_x = candle_nn::ops::sigmoid(x)?;
-    x.mul(&sigmoid_x)
+    gelu(x)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{Device, DType};
+    use candle_core::Device;
 
     #[test]
     fn test_era_forward() -> Result<()> {
@@ -105,19 +97,18 @@ mod tests {
     }
 
     #[test]
-    fn test_entropy_penalty() -> Result<()> {
+    fn test_era_greater_than_gelu() -> Result<()> {
         let device = Device::Cpu;
-        let era = ERAActivation::new(ERAConfig {
-            temperature: 0.1,
-            entropy_weight: 0.1,
-        });
+        let era = ERAActivation::new(ERAConfig { gamma: 0.1 });
 
-        let x = Tensor::randn(0f32, 1.0, (2, 4, 768), &device)?;
-        let penalty = era.calculate_entropy_penalty(&x)?;
+        // For positive inputs, ERA > GELU (since softplus > 0)
+        let x = Tensor::new(&[1.0f32, 2.0, 3.0], &device)?;
+        let era_out = era.forward(&x)?.to_vec1::<f32>()?;
+        let gelu_out = gelu(&x)?.to_vec1::<f32>()?;
 
-        // Penalty should be between 0 and entropy_weight
-        let max_val = penalty.max(0)?.to_vec0::<f32>()?;
-        assert!(max_val <= 0.1);
+        for (e, g) in era_out.iter().zip(gelu_out.iter()) {
+            assert!(e > g, "ERA({}) should be > GELU({})", e, g);
+        }
 
         Ok(())
     }

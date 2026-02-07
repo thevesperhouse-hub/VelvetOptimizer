@@ -1,0 +1,33 @@
+[package]
+name = "vesper-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "VesperAI CLI - Train and benchmark language models"
+
+[[bin]]
+name = "vesper"
+path = "src/main.rs"
+
+[dependencies]
+vesper-core = { path = "../vesper-core" }
+vesper-optimizer = { path = "../vesper-optimizer" }
+vesper-training = { path = "../vesper-training" }
+
+candle-core.workspace = true
+candle-nn.workspace = true
+
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+indicatif.workspace = true
+rand.workspace = true
+
+tokenizers = "0.15"
+hf-hub = "0.3"
+toml = "0.8"

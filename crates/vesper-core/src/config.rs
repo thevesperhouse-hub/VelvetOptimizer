@@ -19,9 +19,8 @@ pub struct VesperConfig {
     pub flylora_alpha: f64,
     pub flylora_sparsity: f32,
 
-    // ERA activation
-    pub era_temperature: f64,
-    pub era_entropy_weight: f64,
+    // ERA activation: γ for GELU(x) + γ * softplus(x)
+    pub era_gamma: f64,
 
     // Training
     pub dropout: f64,
@@ -49,8 +48,7 @@ impl Default for VesperConfig {
             flylora_sparsity: 0.25,
 
             // ERA defaults
-            era_temperature: 0.1,
-            era_entropy_weight: 0.01,
+            era_gamma: 0.1,
 
             // Training defaults
             dropout: 0.1,
@@ -103,6 +101,24 @@ impl VesperConfig {
             intermediate_size: 4096,
             ..Default::default()
         }
+    }
+
+    /// ~1B parameter configuration for cloud training (A100)
+    pub fn xlarge() -> Self {
+        Self {
+            hidden_size: 2048,
+            num_layers: 24,
+            num_heads: 16,
+            intermediate_size: 5504,
+            max_position_embeddings: 4096,
+            ..Default::default()
+        }
+    }
+
+    /// Builder: set vocab_size (must match tokenizer)
+    pub fn with_vocab_size(mut self, vocab_size: usize) -> Self {
+        self.vocab_size = vocab_size;
+        self
     }
 
     /// Calculate total parameters (approximate)

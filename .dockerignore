@@ -1,0 +1,9 @@
+target/
+.git/
+*.safetensors
+checkpoints/
+.vesper_cache/
+benchmark_report*
+node_modules/
+crates/vesper-app/dist/
+crates/vesper-app/node_modules/

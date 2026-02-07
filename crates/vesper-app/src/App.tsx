@@ -93,7 +93,7 @@ function App() {
   const [advancedConfig, setAdvancedConfig] = useState({
     velvet_lr_multiplier: 1.5,
     velvet_beta1: 0.95,
-    era_temperature: 1.0,
+    era_gamma: 0.1,
     flylora_rank: 16,
     flylora_sparsity: 0.75,
   })
@@ -215,7 +215,7 @@ function App() {
           optimizers: [selectedOptimizer], // Utilise l'optimizer sélectionné
           velvet_lr_multiplier: advancedConfig.velvet_lr_multiplier,
           velvet_beta1: advancedConfig.velvet_beta1,
-          era_temperature: advancedConfig.era_temperature,
+          era_gamma: advancedConfig.era_gamma,
           flylora_rank: advancedConfig.flylora_rank,
           flylora_sparsity: advancedConfig.flylora_sparsity,
         }
@@ -300,7 +300,7 @@ function App() {
           // Paramètres avancés
           velvet_lr_multiplier: advancedConfig.velvet_lr_multiplier,
           velvet_beta1: advancedConfig.velvet_beta1,
-          era_temperature: advancedConfig.era_temperature,
+          era_gamma: advancedConfig.era_gamma,
           flylora_rank: advancedConfig.flylora_rank,
           flylora_sparsity: advancedConfig.flylora_sparsity,
         }
@@ -742,15 +742,15 @@ function App() {
                     <div>
                       <div className="flex justify-between text-xs mb-1">
                         <span className="text-white/60">Temperature</span>
-                        <span className="text-white/80">{advancedConfig.era_temperature}</span>
+                        <span className="text-white/80">{advancedConfig.era_gamma}</span>
                       </div>
                       <input
                         type="range"
                         min="0.1"
                         max="2"
                         step="0.1"
-                        value={advancedConfig.era_temperature}
-                        onChange={(e) => setAdvancedConfig(prev => ({ ...prev, era_temperature: parseFloat(e.target.value) }))}
+                        value={advancedConfig.era_gamma}
+                        onChange={(e) => setAdvancedConfig(prev => ({ ...prev, era_gamma: parseFloat(e.target.value) }))}
                         className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-blue-500"
                       />
                     </div>
