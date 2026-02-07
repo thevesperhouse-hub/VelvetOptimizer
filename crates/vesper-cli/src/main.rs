@@ -90,6 +90,14 @@ enum Commands {
         /// Chunk size in MB for streaming mode
         #[arg(long, default_value = "50")]
         chunk_mb: usize,
+
+        /// Optimizer: velvet or adamw
+        #[arg(long, default_value = "velvet")]
+        optimizer: String,
+
+        /// Resume training from a checkpoint (.safetensors)
+        #[arg(long)]
+        resume: Option<PathBuf>,
     },
 
     /// Benchmark Velvet optimizer vs AdamW
@@ -207,13 +215,13 @@ fn main() -> anyhow::Result<()> {
             dataset, format, tokenizer, model_size,
             epochs, batch_size, lr, seq_len,
             save_every, output_dir, max_steps, vocab_size,
-            cache, streaming, chunk_mb,
+            cache, streaming, chunk_mb, optimizer, resume,
         } => {
             train::run(
                 dataset, format, tokenizer, model_size,
                 epochs, batch_size, lr, seq_len,
                 save_every, output_dir, max_steps, vocab_size,
-                cache, streaming, chunk_mb,
+                cache, streaming, chunk_mb, optimizer, resume,
             )?;
         }
 

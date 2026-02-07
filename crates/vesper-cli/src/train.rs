@@ -1,16 +1,70 @@
 //! Train subcommand - Full training pipeline
+//!
+//! Supports:
+//! - In-memory, streaming, and binary cache dataset modes
+//! - Velvet or AdamW optimizer (--optimizer)
+//! - Resume from checkpoint (--resume)
+//! - Auto-save on SIGTERM/SIGINT (Vast.ai preemption safe)
+//! - Periodic checkpointing (--save-every)
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{self, loss::cross_entropy, VarMap, VarBuilder};
+use candle_nn::{self, loss::cross_entropy, VarMap, VarBuilder, Optimizer, optim::AdamW, ParamsAdamW};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use vesper_core::{VesperConfig, VesperLM, MappedDataset};
 use vesper_optimizer::{VelvetOptimizer, VelvetConfig};
-use vesper_training::{Trainer, TrainerConfig, DatasetLoader, StreamingTextLoader};
+use vesper_training::{DatasetLoader, StreamingTextLoader};
 
 use crate::tokenizer;
+
+/// Which optimizer to use
+enum OptimizerKind {
+    Velvet(VelvetOptimizer),
+    AdamW(AdamW),
+}
+
+impl OptimizerKind {
+    fn step(
+        &mut self,
+        loss: &Tensor,
+        varmap: &VarMap,
+        logits: &Tensor,
+        loss_val: f32,
+        vocab_size: usize,
+    ) -> Result<()> {
+        match self {
+            OptimizerKind::Velvet(opt) => {
+                // Entropy-Adaptive LR
+                let current_entropy = compute_logits_entropy(logits, vocab_size)?;
+                let entropy_scale = (current_entropy / 0.5).clamp(0.5, 2.0);
+                opt.set_entropy_scale(entropy_scale);
+
+                // Perplexity-Guided Momentum
+                let current_ppl = (loss_val as f64).exp();
+                let ppl_scale = (40.0 / current_ppl.max(1.0)).clamp(0.5, 2.0);
+                opt.set_perplexity_scale(ppl_scale);
+
+                opt.backward_step(loss, varmap)?;
+            }
+            OptimizerKind::AdamW(opt) => {
+                opt.backward_step(loss)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            OptimizerKind::Velvet(_) => "Velvet",
+            OptimizerKind::AdamW(_) => "AdamW",
+        }
+    }
+}
 
 /// Run the train subcommand
 pub fn run(
@@ -29,8 +83,18 @@ pub fn run(
     cache_path: Option<PathBuf>,
     streaming: bool,
     chunk_mb: usize,
+    optimizer_name: String,
+    resume: Option<PathBuf>,
 ) -> Result<()> {
     println!("\n=== VesperAI Training ===\n");
+
+    // Setup SIGTERM/SIGINT handler for graceful shutdown
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+    ctrlc::set_handler(move || {
+        eprintln!("\n  SIGTERM/SIGINT received! Saving checkpoint before exit...");
+        shutdown_clone.store(true, Ordering::SeqCst);
+    }).ok();
 
     // 1. Select device
     let device = if candle_core::utils::cuda_is_available() {
@@ -61,25 +125,52 @@ pub fn run(
     let config = config.with_vocab_size(vocab_size);
     config.validate()?;
 
-    println!("\n  Model: {} ({} params)", model_size, format_params(config.total_params()));
+    println!("  Model: {} ({} params)", model_size, format_params(config.total_params()));
     println!("  Vocab size: {}", vocab_size);
 
-    // 4. Create model
-    let varmap = VarMap::new();
+    // 4. Create model + optionally resume from checkpoint
+    let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = VesperLM::new(config.clone(), vb)?;
-    println!("  Model initialized on {:?}", device);
+
+    if let Some(ref ckpt) = resume {
+        println!("  Resuming from checkpoint: {}", ckpt.display());
+        varmap.load(ckpt)?;
+        println!("  Weights loaded successfully");
+    } else {
+        println!("  Model initialized from scratch");
+    }
+    println!("  Device: {:?}", device);
 
     // 5. Create optimizer
-    let velvet_config = VelvetConfig {
-        lr,
-        ..VelvetConfig::optimal()
+    let mut optimizer = match optimizer_name.to_lowercase().as_str() {
+        "velvet" => {
+            let velvet_config = VelvetConfig {
+                lr,
+                ..VelvetConfig::optimal()
+            };
+            OptimizerKind::Velvet(VelvetOptimizer::new(velvet_config))
+        }
+        "adamw" => {
+            OptimizerKind::AdamW(AdamW::new(
+                varmap.all_vars(),
+                ParamsAdamW {
+                    lr,
+                    beta1: 0.9,
+                    beta2: 0.999,
+                    eps: 1e-8,
+                    weight_decay: 0.01,
+                },
+            )?)
+        }
+        _ => anyhow::bail!("Unknown optimizer: {}. Use: velvet, adamw", optimizer_name),
     };
-    let mut optimizer = VelvetOptimizer::new(velvet_config);
+    println!("  Optimizer: {}", optimizer.name());
 
     // 6. Route to appropriate training mode
+    std::fs::create_dir_all(&output_dir)?;
+
     if let Some(ref cache) = cache_path {
-        // === CACHE MODE: pre-built binary cache ===
         println!("\n  Mode: Binary cache");
         println!("  Loading cache: {}", cache.display());
         let mapped = MappedDataset::load(cache)
@@ -87,21 +178,22 @@ pub fn run(
         println!("  Cache: {} sequences, {} tokens",
             mapped.num_sequences(), mapped.total_tokens());
 
-        run_cached_training(
-            &model, &varmap, &mut optimizer, &mapped, &device,
+        run_training_loop(
+            &model, &varmap, &mut optimizer, &device,
             epochs, batch_size, seq_len, save_every, &output_dir, max_steps,
+            &shutdown,
+            TrainingData::Cached(&mapped),
         )?;
     } else if streaming {
-        // === STREAMING MODE: read large text files in chunks ===
         println!("\n  Mode: Streaming ({}MB chunks)", chunk_mb);
         let mut loader = StreamingTextLoader::new(&dataset, tok, seq_len, chunk_mb)?;
 
-        run_streaming_training(
+        run_streaming_loop(
             &model, &varmap, &mut optimizer, &mut loader, &device,
-            epochs, batch_size, seq_len, save_every, &output_dir, max_steps,
+            epochs, batch_size, save_every, &output_dir, max_steps,
+            &shutdown,
         )?;
     } else {
-        // === DEFAULT MODE: load entire dataset into memory ===
         println!("\n  Mode: In-memory");
         let loader = DatasetLoader::from_tokenizer(tok, seq_len);
 
@@ -114,7 +206,7 @@ pub fn run(
         println!("  Loading dataset: {} (format: {})", dataset.display(), detected_format);
         let start_load = Instant::now();
 
-        let mut ds = match detected_format.as_str() {
+        let ds = match detected_format.as_str() {
             "text" | "txt" => loader.load_text(&dataset)
                 .context("Failed to load text dataset")?,
             "jsonl" => loader.load_jsonl(&dataset)
@@ -127,42 +219,27 @@ pub fn run(
         println!("  Dataset loaded in {:.1}s ({} samples)",
             start_load.elapsed().as_secs_f64(), ds.len());
 
-        // Use the existing Trainer for in-memory mode
-        let trainer_config = TrainerConfig {
-            num_epochs: epochs,
-            batch_size,
-            learning_rate: lr,
-            log_interval: 10,
-            save_interval: save_every,
-            output_dir: output_dir.to_string_lossy().to_string(),
-            max_steps: if max_steps > 0 { Some(max_steps) } else { None },
-            warmup_steps: 0,
-            gradient_accumulation_steps: 1,
-        };
-
-        let trainer = Trainer::new(trainer_config, device);
-        let start_train = Instant::now();
-        let metrics = trainer.train(&model, &varmap, &mut optimizer, &mut ds)?;
-        let train_time = start_train.elapsed();
-
-        println!("\n=== Training Complete ===");
-        println!("  Total time: {:.1}s", train_time.as_secs_f64());
-        println!("  Epochs: {}", metrics.epochs.len());
-        if let Some(last) = metrics.epochs.last() {
-            println!("  Final loss: {:.4}", last.avg_loss);
-        }
-        println!("  Checkpoints saved to: {}", output_dir.display());
+        run_training_loop(
+            &model, &varmap, &mut optimizer, &device,
+            epochs, batch_size, seq_len, save_every, &output_dir, max_steps,
+            &shutdown,
+            TrainingData::InMemory(&ds),
+        )?;
     }
 
     Ok(())
 }
 
-/// Train from a pre-built binary cache (MappedDataset)
-fn run_cached_training(
+enum TrainingData<'a> {
+    InMemory(&'a vesper_training::Dataset),
+    Cached(&'a MappedDataset),
+}
+
+/// Unified training loop for in-memory and cached modes
+fn run_training_loop(
     model: &VesperLM,
     varmap: &VarMap,
-    optimizer: &mut VelvetOptimizer,
-    mapped: &MappedDataset,
+    optimizer: &mut OptimizerKind,
     device: &Device,
     epochs: usize,
     batch_size: usize,
@@ -170,19 +247,23 @@ fn run_cached_training(
     save_every: usize,
     output_dir: &PathBuf,
     max_steps: usize,
+    shutdown: &Arc<AtomicBool>,
+    data: TrainingData,
 ) -> Result<()> {
-    use indicatif::{ProgressBar, ProgressStyle};
-
-    std::fs::create_dir_all(output_dir)?;
     let vocab_size = model.config().vocab_size;
-    let num_sequences = mapped.num_sequences();
-    let num_batches = (num_sequences + batch_size - 1) / batch_size;
+    let num_samples = match &data {
+        TrainingData::InMemory(ds) => ds.len(),
+        TrainingData::Cached(m) => m.num_sequences(),
+    };
+    let num_batches = (num_samples + batch_size - 1) / batch_size;
     let mut global_step: usize = 0;
 
     let start = Instant::now();
 
+    println!("  Samples: {}, Batches/epoch: {}\n", num_samples, num_batches);
+
     for epoch in 0..epochs {
-        println!("\n[Epoch {}/{}]", epoch + 1, epochs);
+        println!("[Epoch {}/{}]", epoch + 1, epochs);
 
         let pb = ProgressBar::new(num_batches as u64);
         pb.set_style(ProgressStyle::default_bar()
@@ -193,68 +274,72 @@ fn run_cached_training(
         let mut count = 0;
 
         for batch_idx in 0..num_batches {
+            // Check shutdown signal (Vast.ai preemption)
+            if shutdown.load(Ordering::SeqCst) {
+                let path = format!("{}/checkpoint-emergency-step{}.safetensors",
+                    output_dir.display(), global_step);
+                varmap.save(&path)?;
+                println!("\n  Emergency checkpoint saved: {}", path);
+                println!("  Training interrupted at step {} (epoch {}/{})",
+                    global_step, epoch + 1, epochs);
+                return Ok(());
+            }
+
             if max_steps > 0 && global_step >= max_steps {
                 break;
             }
 
-            // Collect batch indices
-            let start_idx = batch_idx * batch_size;
-            let end_idx = (start_idx + batch_size).min(num_sequences);
-            let indices: Vec<usize> = (start_idx..end_idx).collect();
-
-            let batch_seqs = mapped.get_batch(&indices, seq_len);
-            if batch_seqs.is_empty() { continue; }
-
-            // Build tensors
-            let input_ids_data: Vec<Vec<u32>> = batch_seqs.iter()
-                .map(|s| s[..s.len().min(seq_len)].to_vec())
-                .collect();
-            let labels_data: Vec<Vec<i64>> = batch_seqs.iter()
-                .map(|s| s[1..s.len().min(seq_len + 1)].iter().map(|&id| id as i64).collect())
-                .collect();
-
-            let actual_len = input_ids_data[0].len();
-            let input_ids = Tensor::new(input_ids_data, device)?;
-            let attention_mask = Tensor::ones((indices.len(), actual_len), DType::U32, device)?;
-            let labels = Tensor::new(labels_data, device)?;
+            // Build batch tensors
+            let (input_ids, attention_mask, labels) = match &data {
+                TrainingData::InMemory(ds) => {
+                    let s = batch_idx * batch_size;
+                    let e = (s + batch_size).min(ds.len());
+                    prepare_batch_inmemory(ds, s, e, device)?
+                }
+                TrainingData::Cached(m) => {
+                    let s = batch_idx * batch_size;
+                    let e = (s + batch_size).min(m.num_sequences());
+                    prepare_batch_cached(m, s, e, seq_len, device)?
+                }
+            };
 
             // Forward
             let logits = model.forward(&input_ids, Some(&attention_mask))?;
             let loss = compute_loss(&logits, &labels)?;
             let loss_val = loss.to_scalar::<f32>()?;
 
-            // Adaptive scales
-            let current_entropy = compute_logits_entropy(&logits, vocab_size)?;
-            let entropy_scale = (current_entropy / 0.5).clamp(0.5, 2.0);
-            optimizer.set_entropy_scale(entropy_scale);
-
-            let current_ppl = (loss_val as f64).exp();
-            let ppl_scale = (40.0 / current_ppl.max(1.0)).clamp(0.5, 2.0);
-            optimizer.set_perplexity_scale(ppl_scale);
-
-            optimizer.backward_step(&loss, varmap)?;
+            // Backward + optimizer step
+            optimizer.step(&loss, varmap, &logits, loss_val, vocab_size)?;
 
             epoch_loss += loss_val;
             count += 1;
             global_step += 1;
 
             if batch_idx % 50 == 0 {
-                pb.set_message(format!("loss: {:.4}", epoch_loss / count as f32));
+                pb.set_message(format!("loss: {:.4} | step: {}", epoch_loss / count as f32, global_step));
             }
             pb.inc(1);
 
+            // Periodic checkpoint
             if save_every > 0 && global_step % save_every == 0 {
                 let path = format!("{}/checkpoint-{}.safetensors",
                     output_dir.display(), global_step);
                 varmap.save(&path)?;
-                pb.println(format!("  Checkpoint saved: {}", path));
+                pb.println(format!("  Checkpoint saved: {} (step {})", path, global_step));
             }
         }
 
         let avg = epoch_loss / count.max(1) as f32;
         let ppl = (avg as f64).exp() as f32;
         pb.finish_and_clear();
-        println!("  Epoch {}/{}: loss={:.4} ppl={:.2}", epoch + 1, epochs, avg, ppl);
+        println!("  Epoch {}/{}: loss={:.4} ppl={:.2} ({} steps)\n",
+            epoch + 1, epochs, avg, ppl, count);
+
+        // Epoch-end checkpoint
+        let path = format!("{}/checkpoint-epoch{}.safetensors",
+            output_dir.display(), epoch + 1);
+        varmap.save(&path)?;
+        println!("  Epoch checkpoint: {}", path);
 
         if max_steps > 0 && global_step >= max_steps {
             println!("  Reached max_steps ({}), stopping.", max_steps);
@@ -265,29 +350,28 @@ fn run_cached_training(
     // Final checkpoint
     let final_path = format!("{}/checkpoint-final.safetensors", output_dir.display());
     varmap.save(&final_path)?;
-    println!("\n  Final checkpoint: {}", final_path);
+    println!("\n=== Training Complete ===");
+    println!("  Final checkpoint: {}", final_path);
+    println!("  Total steps: {}", global_step);
     println!("  Total time: {:.1}s", start.elapsed().as_secs_f64());
 
     Ok(())
 }
 
-/// Train in streaming mode (chunk-by-chunk reading of large files)
-fn run_streaming_training(
+/// Streaming training loop (chunk-by-chunk)
+fn run_streaming_loop(
     model: &VesperLM,
     varmap: &VarMap,
-    optimizer: &mut VelvetOptimizer,
+    optimizer: &mut OptimizerKind,
     loader: &mut StreamingTextLoader,
     device: &Device,
     epochs: usize,
     batch_size: usize,
-    _seq_len: usize,
     save_every: usize,
     output_dir: &PathBuf,
     max_steps: usize,
+    shutdown: &Arc<AtomicBool>,
 ) -> Result<()> {
-    use indicatif::{ProgressBar, ProgressStyle};
-
-    std::fs::create_dir_all(output_dir)?;
     let vocab_size = model.config().vocab_size;
     let mut global_step: usize = 0;
 
@@ -311,45 +395,29 @@ fn run_streaming_training(
                 .unwrap());
 
             for batch_idx in 0..num_batches {
+                // Check shutdown
+                if shutdown.load(Ordering::SeqCst) {
+                    let path = format!("{}/checkpoint-emergency-step{}.safetensors",
+                        output_dir.display(), global_step);
+                    varmap.save(&path)?;
+                    println!("\n  Emergency checkpoint saved: {}", path);
+                    return Ok(());
+                }
+
                 if max_steps > 0 && global_step >= max_steps {
                     break;
                 }
 
-                let start_idx = batch_idx * batch_size;
-                let end_idx = (start_idx + batch_size).min(chunk_dataset.len());
-
-                let mut input_ids_batch = Vec::new();
-                let mut attention_mask_batch = Vec::new();
-                let mut labels_batch = Vec::new();
-
-                for idx in start_idx..end_idx {
-                    if let Some(sample) = chunk_dataset.get(idx) {
-                        input_ids_batch.push(sample.input_ids.clone());
-                        attention_mask_batch.push(sample.attention_mask.clone());
-                        labels_batch.push(sample.labels.clone());
-                    }
-                }
-
-                if input_ids_batch.is_empty() { continue; }
-
-                let input_ids = Tensor::new(input_ids_batch, device)?;
-                let attention_mask = Tensor::new(attention_mask_batch, device)?;
-                let labels = Tensor::new(labels_batch, device)?;
+                let s = batch_idx * batch_size;
+                let e = (s + batch_size).min(chunk_dataset.len());
+                let (input_ids, attention_mask, labels) =
+                    prepare_batch_inmemory(&chunk_dataset, s, e, device)?;
 
                 let logits = model.forward(&input_ids, Some(&attention_mask))?;
                 let loss = compute_loss(&logits, &labels)?;
                 let loss_val = loss.to_scalar::<f32>()?;
 
-                // Adaptive scales
-                let current_entropy = compute_logits_entropy(&logits, vocab_size)?;
-                let entropy_scale = (current_entropy / 0.5).clamp(0.5, 2.0);
-                optimizer.set_entropy_scale(entropy_scale);
-
-                let current_ppl = (loss_val as f64).exp();
-                let ppl_scale = (40.0 / current_ppl.max(1.0)).clamp(0.5, 2.0);
-                optimizer.set_perplexity_scale(ppl_scale);
-
-                optimizer.backward_step(&loss, varmap)?;
+                optimizer.step(&loss, varmap, &logits, loss_val, vocab_size)?;
 
                 epoch_loss += loss_val;
                 epoch_count += 1;
@@ -380,19 +448,78 @@ fn run_streaming_training(
         println!("  Epoch {}/{}: loss={:.4} ppl={:.2} ({} chunks, {} steps)",
             epoch + 1, epochs, avg, ppl, chunk_idx, epoch_count);
 
+        // Epoch checkpoint
+        let path = format!("{}/checkpoint-epoch{}.safetensors",
+            output_dir.display(), epoch + 1);
+        varmap.save(&path)?;
+        println!("  Epoch checkpoint: {}", path);
+
         if max_steps > 0 && global_step >= max_steps {
             println!("  Reached max_steps ({}), stopping.", max_steps);
             break;
         }
     }
 
-    // Final checkpoint
     let final_path = format!("{}/checkpoint-final.safetensors", output_dir.display());
     varmap.save(&final_path)?;
-    println!("\n  Final checkpoint: {}", final_path);
+    println!("\n=== Training Complete ===");
+    println!("  Final checkpoint: {}", final_path);
+    println!("  Total steps: {}", global_step);
     println!("  Total time: {:.1}s", start.elapsed().as_secs_f64());
 
     Ok(())
+}
+
+fn prepare_batch_inmemory(
+    ds: &vesper_training::Dataset,
+    start: usize,
+    end: usize,
+    device: &Device,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let mut input_ids = Vec::new();
+    let mut masks = Vec::new();
+    let mut labels = Vec::new();
+
+    for idx in start..end {
+        if let Some(s) = ds.get(idx) {
+            input_ids.push(s.input_ids.clone());
+            masks.push(s.attention_mask.clone());
+            labels.push(s.labels.clone());
+        }
+    }
+
+    Ok((
+        Tensor::new(input_ids, device)?,
+        Tensor::new(masks, device)?,
+        Tensor::new(labels, device)?,
+    ))
+}
+
+fn prepare_batch_cached(
+    mapped: &MappedDataset,
+    start: usize,
+    end: usize,
+    seq_len: usize,
+    device: &Device,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let indices: Vec<usize> = (start..end).collect();
+    let batch_seqs = mapped.get_batch(&indices, seq_len);
+
+    let input_ids_data: Vec<Vec<u32>> = batch_seqs.iter()
+        .map(|s| s[..s.len().min(seq_len)].to_vec())
+        .collect();
+    let labels_data: Vec<Vec<i64>> = batch_seqs.iter()
+        .map(|s| s[1..s.len().min(seq_len + 1)].iter().map(|&id| id as i64).collect())
+        .collect();
+
+    let actual_len = input_ids_data[0].len();
+    let batch_count = indices.len();
+
+    Ok((
+        Tensor::new(input_ids_data, device)?,
+        Tensor::ones((batch_count, actual_len), DType::U32, device)?,
+        Tensor::new(labels_data, device)?,
+    ))
 }
 
 fn compute_loss(logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
