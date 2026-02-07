@@ -28,7 +28,8 @@ pub fn run(
     };
 
     // Load tokenizer
-    let tok = tokenizer::load_tokenizer(&tokenizer_name)?;
+    let resolved_tokenizer = resolve_tokenizer(&tokenizer_name, &model_size);
+    let tok = tokenizer::load_tokenizer(&resolved_tokenizer)?;
     let vocab_size = if vocab_size_override > 0 {
         vocab_size_override
     } else {
@@ -105,6 +106,16 @@ pub fn run(
 
     println!("\n");
     Ok(())
+}
+
+fn resolve_tokenizer(name: &str, model_size: &str) -> String {
+    if name != "auto" {
+        return name.to_string();
+    }
+    match model_size {
+        "tiny" | "small" | "tiny-moe" => "gpt2".to_string(),
+        _ => "meta-llama/Meta-Llama-3-8B".to_string(),
+    }
 }
 
 fn sample_token(probs: &[f32]) -> u32 {

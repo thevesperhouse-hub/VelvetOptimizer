@@ -122,15 +122,7 @@ pub fn run(
         Device::Cpu
     };
 
-    // 2. Load tokenizer
-    let tok = tokenizer::load_tokenizer(&tokenizer_name)?;
-    let vocab_size = if vocab_size_override > 0 {
-        vocab_size_override
-    } else {
-        tokenizer::vocab_size(&tok)
-    };
-
-    // 3. Build model config
+    // 2. Build model config (needed to resolve tokenizer)
     let config = match model_size.as_str() {
         "tiny" => VesperConfig::tiny(),
         "small" => VesperConfig::small(),
@@ -144,6 +136,15 @@ pub fn run(
     };
     // Apply --moe flag (overrides preset if both specified)
     let config = if moe { config.with_moe(num_experts, top_k) } else { config };
+    // 3. Resolve tokenizer ("auto" picks based on model size)
+    let resolved_tokenizer = resolve_tokenizer(&tokenizer_name, &model_size);
+    let tok = tokenizer::load_tokenizer(&resolved_tokenizer)?;
+    let vocab_size = if vocab_size_override > 0 {
+        vocab_size_override
+    } else {
+        tokenizer::vocab_size(&tok)
+    };
+
     let config = config.with_vocab_size(vocab_size);
     config.validate()?;
 
@@ -664,6 +665,19 @@ fn detect_format(path: &PathBuf) -> String {
         Some("json") => "squad".to_string(),
         Some("txt") | Some("text") => "text".to_string(),
         _ => "text".to_string(),
+    }
+}
+
+/// Resolve "auto" tokenizer to the best default for the model size.
+/// - tiny, small: gpt2 (50K vocab, no HF token needed, fast for local tests)
+/// - medium+, cloud, MoE: meta-llama/Meta-Llama-3-8B (128K vocab, best encoding efficiency)
+fn resolve_tokenizer(name: &str, model_size: &str) -> String {
+    if name != "auto" {
+        return name.to_string();
+    }
+    match model_size {
+        "tiny" | "small" | "tiny-moe" => "gpt2".to_string(),
+        _ => "meta-llama/Meta-Llama-3-8B".to_string(),
     }
 }
 

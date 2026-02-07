@@ -39,8 +39,9 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         format: String,
 
-        /// HuggingFace tokenizer name (e.g., "gpt2", "meta-llama/Llama-2-7b-hf")
-        #[arg(long, default_value = "gpt2")]
+        /// HuggingFace tokenizer name (default: auto-selected based on model size)
+        /// "auto" = gpt2 for tiny/small, meta-llama/Meta-Llama-3-8B for medium+
+        #[arg(long, default_value = "auto")]
         tokenizer: String,
 
         /// Model size: tiny, small, medium, large, xlarge
@@ -118,8 +119,8 @@ enum Commands {
         #[arg(long)]
         dataset: PathBuf,
 
-        /// HuggingFace tokenizer name
-        #[arg(long, default_value = "gpt2")]
+        /// HuggingFace tokenizer name ("auto" = based on model size)
+        #[arg(long, default_value = "auto")]
         tokenizer: String,
 
         /// Model size: tiny, small, medium, large, xlarge
@@ -153,8 +154,8 @@ enum Commands {
         #[arg(long)]
         model: PathBuf,
 
-        /// HuggingFace tokenizer name
-        #[arg(long, default_value = "gpt2")]
+        /// HuggingFace tokenizer name ("auto" = based on model size)
+        #[arg(long, default_value = "auto")]
         tokenizer: String,
 
         /// Model size (must match the trained model)
@@ -194,7 +195,7 @@ enum CacheAction {
         dataset: PathBuf,
 
         /// HuggingFace tokenizer name
-        #[arg(long, default_value = "gpt2")]
+        #[arg(long, default_value = "auto")]
         tokenizer: String,
 
         /// Sequence length

@@ -79,7 +79,8 @@ pub fn run(
     };
 
     // Load tokenizer and dataset
-    let tok = tokenizer::load_tokenizer(&tokenizer_name)?;
+    let resolved_tokenizer = resolve_tokenizer(&tokenizer_name, &model_size);
+    let tok = tokenizer::load_tokenizer(&resolved_tokenizer)?;
     let vocab_size = tokenizer::vocab_size(&tok);
 
     let loader = DatasetLoader::from_tokenizer(tok, seq_len);
@@ -434,4 +435,14 @@ fn compute_logits_entropy(logits: &Tensor, vocab_size: usize) -> Result<f64> {
     let mean = normalized.mean_all()?.to_scalar::<f32>()? as f64;
 
     Ok(mean)
+}
+
+fn resolve_tokenizer(name: &str, model_size: &str) -> String {
+    if name != "auto" {
+        return name.to_string();
+    }
+    match model_size {
+        "tiny" | "small" | "tiny-moe" => "gpt2".to_string(),
+        _ => "meta-llama/Meta-Llama-3-8B".to_string(),
+    }
 }

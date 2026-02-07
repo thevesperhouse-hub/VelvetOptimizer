@@ -17,8 +17,9 @@ pub fn build(
 ) -> Result<()> {
     println!("\n=== VesperAI Cache Builder ===\n");
 
-    // Load tokenizer
-    let tok = tokenizer::load_tokenizer(&tokenizer_name)?;
+    // Load tokenizer ("auto" defaults to gpt2 for cache — no model context)
+    let resolved = if tokenizer_name == "auto" { "gpt2".to_string() } else { tokenizer_name };
+    let tok = tokenizer::load_tokenizer(&resolved)?;
     let vocab_size = tokenizer::vocab_size(&tok);
 
     // Load and tokenize dataset
