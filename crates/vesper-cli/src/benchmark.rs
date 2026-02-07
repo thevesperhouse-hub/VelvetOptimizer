@@ -222,7 +222,7 @@ fn run_adamw(
             let end_idx = (start_idx + batch_size).min(dataset.len());
 
             let (input_ids, attention_mask, labels) = prepare_batch(dataset, start_idx, end_idx, device)?;
-            let logits = model.forward(&input_ids, Some(&attention_mask))?;
+            let (logits, _aux_loss) = model.forward(&input_ids, Some(&attention_mask))?;
             let loss = compute_loss(&logits, &labels)?;
             let loss_val = loss.to_scalar::<f32>()?;
 
@@ -314,7 +314,7 @@ fn run_velvet(
             let end_idx = (start_idx + batch_size).min(dataset.len());
 
             let (input_ids, attention_mask, labels) = prepare_batch(dataset, start_idx, end_idx, device)?;
-            let logits = model.forward(&input_ids, Some(&attention_mask))?;
+            let (logits, _aux_loss) = model.forward(&input_ids, Some(&attention_mask))?;
             let loss = compute_loss(&logits, &labels)?;
             let loss_val = loss.to_scalar::<f32>()?;
 

@@ -23,3 +23,4 @@ bytemuck = { version = "1.14", features = ["derive"] }
 
 [dev-dependencies]
 approx = "0.5"
+tempfile = "3.10"

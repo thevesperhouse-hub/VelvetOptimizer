@@ -1030,9 +1030,9 @@ async fn train_with_optimizer(
             let target_ids = Tensor::from_vec(batch_targets, (total_tokens,), device)
                 .map_err(|e| format!("Erreur target: {}", e))?;
             
-            let logits = model.forward(&input_ids, None)
+            let (logits, _aux_loss) = model.forward(&input_ids, None)
                 .map_err(|e| format!("Erreur forward: {}", e))?;
-            
+
             let logits = logits.flatten(0, 1)
                 .map_err(|e| format!("Erreur flatten: {}", e))?;
             

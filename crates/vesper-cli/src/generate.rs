@@ -66,7 +66,7 @@ pub fn run(
     // Autoregressive generation
     for _ in 0..max_tokens {
         let input = Tensor::new(&token_ids[..], &device)?.unsqueeze(0)?;
-        let logits = model.forward(&input, None)?;
+        let (logits, _aux_loss) = model.forward(&input, None)?;
 
         // Get logits for last position
         let seq_len = token_ids.len();

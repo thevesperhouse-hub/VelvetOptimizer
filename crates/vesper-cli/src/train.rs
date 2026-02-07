@@ -99,6 +99,9 @@ pub fn run(
     chunk_mb: usize,
     optimizer_name: String,
     resume: Option<PathBuf>,
+    moe: bool,
+    num_experts: usize,
+    top_k: usize,
 ) -> Result<()> {
     println!("\n=== VesperAI Training ===\n");
 
@@ -132,14 +135,24 @@ pub fn run(
         "tiny" => VesperConfig::tiny(),
         "small" => VesperConfig::small(),
         "medium" => VesperConfig::medium(),
+        "tiny-moe" => VesperConfig::tiny_moe(),
+        "medium-moe" => VesperConfig::medium_moe(),
         "large" => VesperConfig::large(),
+        "large-moe" => VesperConfig::large_moe(),
         "xlarge" | "1b" => VesperConfig::xlarge(),
-        _ => anyhow::bail!("Unknown model size: {}. Use: tiny, small, medium, large, xlarge", model_size),
+        _ => anyhow::bail!("Unknown model size: {}. Use: tiny, small, medium, medium-moe, large, large-moe, xlarge", model_size),
     };
+    // Apply --moe flag (overrides preset if both specified)
+    let config = if moe { config.with_moe(num_experts, top_k) } else { config };
     let config = config.with_vocab_size(vocab_size);
     config.validate()?;
 
-    println!("  Model: {} ({} params)", model_size, format_params(config.total_params()));
+    let moe_str = if config.moe_enabled {
+        format!(" [MoE: {}x top-{} experts]", config.moe_num_experts, config.moe_top_k)
+    } else {
+        String::new()
+    };
+    println!("  Model: {} ({} params){}", model_size, format_params(config.total_params()), moe_str);
     println!("  Vocab size: {}", vocab_size);
 
     // 4. Create model + optionally resume from checkpoint
@@ -341,8 +354,13 @@ fn run_training_loop(
             };
 
             // Forward
-            let logits = model.forward(&input_ids, Some(&attention_mask))?;
-            let loss = compute_loss(&logits, &labels)?;
+            let (logits, aux_loss_opt) = model.forward(&input_ids, Some(&attention_mask))?;
+            let mut loss = compute_loss(&logits, &labels)?;
+
+            // Add MoE auxiliary loss if present
+            if let Some(aux_loss) = aux_loss_opt {
+                loss = loss.add(&(aux_loss * model.config().moe_aux_loss_weight)?)?;
+            }
             let loss_val = loss.to_scalar::<f32>()?;
 
             // Backward + optimizer step
@@ -474,8 +492,11 @@ fn run_streaming_loop(
                 let (input_ids, attention_mask, labels) =
                     prepare_batch_inmemory(&chunk_dataset, s, e, device)?;
 
-                let logits = model.forward(&input_ids, Some(&attention_mask))?;
-                let loss = compute_loss(&logits, &labels)?;
+                let (logits, aux_loss_opt) = model.forward(&input_ids, Some(&attention_mask))?;
+                let mut loss = compute_loss(&logits, &labels)?;
+                if let Some(aux_loss) = aux_loss_opt {
+                    loss = loss.add(&(aux_loss * model.config().moe_aux_loss_weight)?)?;
+                }
                 let loss_val = loss.to_scalar::<f32>()?;
 
                 optimizer.step(&loss, varmap, &logits, loss_val, vocab_size)?;

@@ -98,6 +98,18 @@ enum Commands {
         /// Resume training from a checkpoint (.safetensors)
         #[arg(long)]
         resume: Option<PathBuf>,
+
+        /// Enable Mixture of Experts
+        #[arg(long)]
+        moe: bool,
+
+        /// Number of experts (requires --moe)
+        #[arg(long, default_value = "8")]
+        num_experts: usize,
+
+        /// Top-K experts per token (requires --moe)
+        #[arg(long, default_value = "2")]
+        top_k: usize,
     },
 
     /// Benchmark Velvet optimizer vs AdamW
@@ -216,12 +228,14 @@ fn main() -> anyhow::Result<()> {
             epochs, batch_size, lr, seq_len,
             save_every, output_dir, max_steps, vocab_size,
             cache, streaming, chunk_mb, optimizer, resume,
+            moe, num_experts, top_k,
         } => {
             train::run(
                 dataset, format, tokenizer, model_size,
                 epochs, batch_size, lr, seq_len,
                 save_every, output_dir, max_steps, vocab_size,
                 cache, streaming, chunk_mb, optimizer, resume,
+                moe, num_experts, top_k,
             )?;
         }
 

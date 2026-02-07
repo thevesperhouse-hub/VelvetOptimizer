@@ -29,6 +29,12 @@ pub struct VesperConfig {
     // Attention
     pub use_flash_attn: bool,
     pub rope_theta: f64,
+
+    // Mixture of Experts
+    pub moe_enabled: bool,
+    pub moe_num_experts: usize,
+    pub moe_top_k: usize,
+    pub moe_aux_loss_weight: f64,
 }
 
 impl Default for VesperConfig {
@@ -57,6 +63,12 @@ impl Default for VesperConfig {
             // Attention defaults
             use_flash_attn: true,
             rope_theta: 10000.0,
+
+            // MoE defaults (disabled)
+            moe_enabled: false,
+            moe_num_experts: 8,
+            moe_top_k: 2,
+            moe_aux_loss_weight: 0.01,
         }
     }
 }
@@ -115,29 +127,75 @@ impl VesperConfig {
         }
     }
 
+    /// Tiny model with MoE (4 experts, top-2)
+    pub fn tiny_moe() -> Self {
+        Self {
+            moe_enabled: true,
+            moe_num_experts: 4,
+            moe_top_k: 2,
+            moe_aux_loss_weight: 0.01,
+            ..Self::tiny()
+        }
+    }
+
+    /// Medium model with MoE (8 experts, top-2)
+    pub fn medium_moe() -> Self {
+        Self {
+            moe_enabled: true,
+            moe_num_experts: 8,
+            moe_top_k: 2,
+            moe_aux_loss_weight: 0.01,
+            ..Self::medium()
+        }
+    }
+
+    /// Large model with MoE (16 experts, top-2)
+    pub fn large_moe() -> Self {
+        Self {
+            moe_enabled: true,
+            moe_num_experts: 16,
+            moe_top_k: 2,
+            moe_aux_loss_weight: 0.01,
+            ..Self::large()
+        }
+    }
+
     /// Builder: set vocab_size (must match tokenizer)
     pub fn with_vocab_size(mut self, vocab_size: usize) -> Self {
         self.vocab_size = vocab_size;
         self
     }
 
+    /// Builder: enable MoE with given expert count and top-k
+    pub fn with_moe(mut self, num_experts: usize, top_k: usize) -> Self {
+        self.moe_enabled = true;
+        self.moe_num_experts = num_experts;
+        self.moe_top_k = top_k;
+        self
+    }
+
     /// Calculate total parameters (approximate)
     pub fn total_params(&self) -> usize {
         let embedding_params = self.vocab_size * self.hidden_size;
-        
+
         let attention_params = self.num_layers * (
             // QKV projections (with FlyLoRA reduction)
             3 * self.hidden_size * (self.flylora_rank * 2) +
             // Output projection
             self.hidden_size * self.hidden_size
         );
-        
-        let ffn_params = self.num_layers * (
-            2 * self.hidden_size * self.intermediate_size
-        );
-        
+
+        let ffn_params_per_expert = 2 * self.hidden_size * self.intermediate_size;
+        let ffn_params = self.num_layers * if self.moe_enabled {
+            // Router: hidden_size -> num_experts
+            let router_params = self.hidden_size * self.moe_num_experts;
+            router_params + self.moe_num_experts * ffn_params_per_expert
+        } else {
+            ffn_params_per_expert
+        };
+
         let norm_params = self.num_layers * 2 * self.hidden_size;
-        
+
         embedding_params + attention_params + ffn_params + norm_params
     }
 
@@ -153,6 +211,19 @@ impl VesperConfig {
 
         if self.flylora_sparsity < 0.0 || self.flylora_sparsity > 1.0 {
             anyhow::bail!("flylora_sparsity must be between 0 and 1");
+        }
+
+        if self.moe_enabled {
+            if self.moe_top_k == 0 || self.moe_top_k > self.moe_num_experts {
+                anyhow::bail!(
+                    "moe_top_k ({}) must be between 1 and moe_num_experts ({})",
+                    self.moe_top_k,
+                    self.moe_num_experts
+                );
+            }
+            if self.moe_num_experts < 2 {
+                anyhow::bail!("moe_num_experts must be at least 2");
+            }
         }
 
         Ok(())

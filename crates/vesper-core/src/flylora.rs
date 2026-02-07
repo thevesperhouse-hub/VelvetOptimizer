@@ -141,7 +141,7 @@ impl FlyLoRALinear {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
+    use candle_core::{Device, DType};
     use candle_nn::VarBuilder;
 
     #[test]

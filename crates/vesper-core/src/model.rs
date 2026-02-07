@@ -9,6 +9,7 @@ use crate::attention::MultiHeadAttention;
 use crate::config::VesperConfig;
 use crate::era::ERAActivation;
 use crate::flylora::FlyLoRALinear;
+use crate::moe::MoELayer;
 
 pub struct VesperLM {
     config: VesperConfig,
@@ -57,14 +58,14 @@ impl VesperLM {
         })
     }
 
-    pub fn forward(&self, input_ids: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
+    pub fn forward(&self, input_ids: &Tensor, attention_mask: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
         let mut hidden_states = self.embeddings.forward(input_ids)?;
 
         // Convert 2D attention mask [batch, seq] to 4D causal mask [batch, 1, seq, seq]
         let mask_4d = if let Some(mask) = attention_mask {
             let dims = mask.dims();
             if dims.len() == 2 {
-                let (batch_size, seq_len) = (dims[0], dims[1]);
+                let (_batch_size, seq_len) = (dims[0], dims[1]);
                 // Create causal mask
                 let mut causal_data = vec![0.0f32; seq_len * seq_len];
                 for i in 0..seq_len {
@@ -91,16 +92,27 @@ impl VesperLM {
             None
         };
 
-        // Pass through transformer layers
+        // Pass through transformer layers, accumulating MoE auxiliary losses
+        let mut total_aux_loss: Option<Tensor> = None;
+
         for layer in &self.layers {
-            hidden_states = layer.forward(&hidden_states, mask_4d.as_ref())?;
+            let (new_hidden, aux_loss) = layer.forward(&hidden_states, mask_4d.as_ref())?;
+            hidden_states = new_hidden;
+
+            if let Some(aux) = aux_loss {
+                total_aux_loss = Some(match total_aux_loss {
+                    Some(acc) => acc.add(&aux)?,
+                    None => aux,
+                });
+            }
         }
 
         // Final layer norm
         hidden_states = self.final_norm.forward(&hidden_states)?;
 
         // Language modeling head
-        self.lm_head.forward(&hidden_states)
+        let logits = self.lm_head.forward(&hidden_states)?;
+        Ok((logits, total_aux_loss))
     }
 
     pub fn config(&self) -> &VesperConfig {
@@ -108,9 +120,14 @@ impl VesperLM {
     }
 }
 
+enum FFNLayer {
+    Standard(FeedForward),
+    MoE(MoELayer),
+}
+
 struct TransformerLayer {
     attention: MultiHeadAttention,
-    ffn: FeedForward,
+    ffn: FFNLayer,
     attention_norm: LayerNorm,
     ffn_norm: LayerNorm,
 }
@@ -125,7 +142,11 @@ impl TransformerLayer {
             vb.pp("attention"),
         )?;
 
-        let ffn = FeedForward::new(config, vb.pp("ffn"))?;
+        let ffn = if config.moe_enabled {
+            FFNLayer::MoE(MoELayer::new(config, vb.pp("ffn"))?)
+        } else {
+            FFNLayer::Standard(FeedForward::new(config, vb.pp("ffn"))?)
+        };
 
         let attention_norm = candle_nn::layer_norm(
             config.hidden_size,
@@ -147,7 +168,7 @@ impl TransformerLayer {
         })
     }
 
-    fn forward(&self, hidden_states: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
+    fn forward(&self, hidden_states: &Tensor, attention_mask: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
         // Pre-norm attention with residual
         let normed = self.attention_norm.forward(hidden_states)?;
         let attn_out = self.attention.forward(&normed, attention_mask)?;
@@ -155,8 +176,14 @@ impl TransformerLayer {
 
         // Pre-norm FFN with residual
         let normed = self.ffn_norm.forward(&hidden_states)?;
-        let ffn_out = self.ffn.forward(&normed)?;
-        hidden_states.add(&ffn_out)
+        let (ffn_out, aux_loss) = match &self.ffn {
+            FFNLayer::Standard(ffn) => (ffn.forward(&normed)?, None),
+            FFNLayer::MoE(moe) => {
+                let (out, aux) = moe.forward(&normed)?;
+                (out, Some(aux))
+            }
+        };
+        Ok((hidden_states.add(&ffn_out)?, aux_loss))
     }
 }
 
@@ -220,13 +247,13 @@ impl FeedForward {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
+    use candle_core::{Device, DType};
 
     #[test]
     fn test_model_creation() -> Result<()> {
         let device = Device::Cpu;
         let vb = VarBuilder::zeros(DType::F32, &device);
-        
+
         let config = VesperConfig::tiny();
         let model = VesperLM::new(config.clone(), vb)?;
 
@@ -238,14 +265,31 @@ mod tests {
     fn test_model_forward() -> Result<()> {
         let device = Device::Cpu;
         let vb = VarBuilder::zeros(DType::F32, &device);
-        
+
         let config = VesperConfig::tiny();
         let model = VesperLM::new(config.clone(), vb)?;
 
         let input_ids = Tensor::zeros((2, 32), DType::U32, &device)?;
-        let logits = model.forward(&input_ids, None)?;
+        let (logits, aux_loss) = model.forward(&input_ids, None)?;
 
         assert_eq!(logits.dims(), &[2, 32, config.vocab_size]);
+        assert!(aux_loss.is_none()); // No MoE, no aux loss
+        Ok(())
+    }
+
+    #[test]
+    fn test_moe_model_forward() -> Result<()> {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let config = VesperConfig::tiny().with_moe(4, 2);
+        let model = VesperLM::new(config.clone(), vb)?;
+
+        let input_ids = Tensor::zeros((2, 16), DType::U32, &device)?;
+        let (logits, aux_loss) = model.forward(&input_ids, None)?;
+
+        assert_eq!(logits.dims(), &[2, 16, config.vocab_size]);
+        assert!(aux_loss.is_some()); // MoE enabled → aux loss present
         Ok(())
     }
 }

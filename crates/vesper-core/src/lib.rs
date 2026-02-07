@@ -8,12 +8,14 @@ pub mod model;
 pub mod flylora;
 pub mod era;
 pub mod attention;
+pub mod moe;
 pub mod dataset_cache;
 
 pub use config::VesperConfig;
 pub use model::VesperLM;
 pub use flylora::FlyLoRALinear;
 pub use era::ERAActivation;
+pub use moe::{MoELayer, ExpertFFN};
 pub use dataset_cache::{MappedDataset, CacheBuilder, cache_name_from_path};
 
 

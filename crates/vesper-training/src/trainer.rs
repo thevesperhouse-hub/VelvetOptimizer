@@ -142,7 +142,7 @@ impl Trainer {
             let batch = self.prepare_batch(dataset, start_idx, end_idx)?;
 
             // Forward pass
-            let logits = model.forward(&batch.input_ids, Some(&batch.attention_mask))?;
+            let (logits, _aux_loss) = model.forward(&batch.input_ids, Some(&batch.attention_mask))?;
 
             // Compute loss (cross-entropy for language modeling)
             let loss = self.compute_loss(&logits, &batch.labels)?;
