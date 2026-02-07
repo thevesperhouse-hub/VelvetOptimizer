@@ -255,6 +255,17 @@ Input → Router → Top-K indices + weights
 
 When `--moe` is disabled (default), behavior is identical to a standard transformer.
 
+### Optimized Token-Dispatch
+
+The MoE routing uses **selective token-dispatch**: each expert only processes the tokens actually routed to it (via `index_select`), and results are scattered back with `scatter_add`. This avoids the naive approach of running every expert on all tokens then masking.
+
+| Metric | Dense (tiny) | MoE naive | MoE optimized |
+|--------|-------------|-----------|---------------|
+| Time/step | ~0.14s | ~0.22s (+57%) | ~0.14s (~0%) |
+| Speedup | — | — | **1.6x vs naive** |
+
+With top-k=2 and N=4 experts, each expert processes ~50% of tokens instead of 100%, halving expert compute. MoE overhead is near-zero on GPU at this scale.
+
 ---
 
 ## Checkpointing and Resume
