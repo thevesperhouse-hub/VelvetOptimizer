@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{self, loss::cross_entropy, VarMap, VarBuilder, Optimizer, optim::AdamW, ParamsAdamW};
 use indicatif::{ProgressBar, ProgressStyle};
+use serde::{Serialize, Deserialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,6 +22,19 @@ use vesper_optimizer::{VelvetOptimizer, VelvetConfig};
 use vesper_training::{DatasetLoader, StreamingTextLoader};
 
 use crate::tokenizer;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrainingLog {
+    optimizer: String,
+    model_size: String,
+    steps: Vec<StepLog>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StepLog {
+    step: usize,
+    loss: f32,
+}
 
 /// Which optimizer to use
 enum OptimizerKind {
@@ -133,13 +147,16 @@ pub fn run(
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = VesperLM::new(config.clone(), vb)?;
 
-    if let Some(ref ckpt) = resume {
+    let start_step = if let Some(ref ckpt) = resume {
         println!("  Resuming from checkpoint: {}", ckpt.display());
         varmap.load(ckpt)?;
-        println!("  Weights loaded successfully");
+        let step = detect_step_from_path(ckpt);
+        println!("  Weights loaded successfully (resuming from step {})", step);
+        step
     } else {
         println!("  Model initialized from scratch");
-    }
+        0
+    };
     println!("  Device: {:?}", device);
 
     // 5. Create optimizer
@@ -181,7 +198,7 @@ pub fn run(
         run_training_loop(
             &model, &varmap, &mut optimizer, &device,
             epochs, batch_size, seq_len, save_every, &output_dir, max_steps,
-            &shutdown,
+            &shutdown, start_step, &optimizer_name, &model_size,
             TrainingData::Cached(&mapped),
         )?;
     } else if streaming {
@@ -191,7 +208,7 @@ pub fn run(
         run_streaming_loop(
             &model, &varmap, &mut optimizer, &mut loader, &device,
             epochs, batch_size, save_every, &output_dir, max_steps,
-            &shutdown,
+            &shutdown, start_step, &optimizer_name, &model_size,
         )?;
     } else {
         println!("\n  Mode: In-memory");
@@ -222,7 +239,7 @@ pub fn run(
         run_training_loop(
             &model, &varmap, &mut optimizer, &device,
             epochs, batch_size, seq_len, save_every, &output_dir, max_steps,
-            &shutdown,
+            &shutdown, start_step, &optimizer_name, &model_size,
             TrainingData::InMemory(&ds),
         )?;
     }
@@ -248,6 +265,9 @@ fn run_training_loop(
     output_dir: &PathBuf,
     max_steps: usize,
     shutdown: &Arc<AtomicBool>,
+    start_step: usize,
+    optimizer_name: &str,
+    model_size: &str,
     data: TrainingData,
 ) -> Result<()> {
     let vocab_size = model.config().vocab_size;
@@ -256,11 +276,27 @@ fn run_training_loop(
         TrainingData::Cached(m) => m.num_sequences(),
     };
     let num_batches = (num_samples + batch_size - 1) / batch_size;
-    let mut global_step: usize = 0;
+    let mut global_step: usize = start_step;
+    let mut log = TrainingLog {
+        optimizer: optimizer_name.to_string(),
+        model_size: model_size.to_string(),
+        steps: Vec::new(),
+    };
+
+    // Load existing log if resuming
+    let log_path = format!("{}/training_log.json", output_dir.display());
+    if start_step > 0 {
+        if let Ok(data) = std::fs::read_to_string(&log_path) {
+            if let Ok(existing) = serde_json::from_str::<TrainingLog>(&data) {
+                log.steps = existing.steps;
+                println!("  Resumed training log ({} existing entries)", log.steps.len());
+            }
+        }
+    }
 
     let start = Instant::now();
 
-    println!("  Samples: {}, Batches/epoch: {}\n", num_samples, num_batches);
+    println!("  Samples: {}, Batches/epoch: {}, Start step: {}\n", num_samples, num_batches, start_step);
 
     for epoch in 0..epochs {
         println!("[Epoch {}/{}]", epoch + 1, epochs);
@@ -279,6 +315,7 @@ fn run_training_loop(
                 let path = format!("{}/checkpoint-emergency-step{}.safetensors",
                     output_dir.display(), global_step);
                 varmap.save(&path)?;
+                save_log(&log, &log_path)?;
                 println!("\n  Emergency checkpoint saved: {}", path);
                 println!("  Training interrupted at step {} (epoch {}/{})",
                     global_step, epoch + 1, epochs);
@@ -315,16 +352,19 @@ fn run_training_loop(
             count += 1;
             global_step += 1;
 
+            log.steps.push(StepLog { step: global_step, loss: loss_val });
+
             if batch_idx % 50 == 0 {
                 pb.set_message(format!("loss: {:.4} | step: {}", epoch_loss / count as f32, global_step));
             }
             pb.inc(1);
 
-            // Periodic checkpoint
+            // Periodic checkpoint + save log
             if save_every > 0 && global_step % save_every == 0 {
                 let path = format!("{}/checkpoint-{}.safetensors",
                     output_dir.display(), global_step);
                 varmap.save(&path)?;
+                save_log(&log, &log_path)?;
                 pb.println(format!("  Checkpoint saved: {} (step {})", path, global_step));
             }
         }
@@ -335,10 +375,11 @@ fn run_training_loop(
         println!("  Epoch {}/{}: loss={:.4} ppl={:.2} ({} steps)\n",
             epoch + 1, epochs, avg, ppl, count);
 
-        // Epoch-end checkpoint
+        // Epoch-end checkpoint + save log
         let path = format!("{}/checkpoint-epoch{}.safetensors",
             output_dir.display(), epoch + 1);
         varmap.save(&path)?;
+        save_log(&log, &log_path)?;
         println!("  Epoch checkpoint: {}", path);
 
         if max_steps > 0 && global_step >= max_steps {
@@ -347,11 +388,13 @@ fn run_training_loop(
         }
     }
 
-    // Final checkpoint
+    // Final checkpoint + save log
     let final_path = format!("{}/checkpoint-final.safetensors", output_dir.display());
     varmap.save(&final_path)?;
+    save_log(&log, &log_path)?;
     println!("\n=== Training Complete ===");
     println!("  Final checkpoint: {}", final_path);
+    println!("  Training log: {}", log_path);
     println!("  Total steps: {}", global_step);
     println!("  Total time: {:.1}s", start.elapsed().as_secs_f64());
 
@@ -371,9 +414,26 @@ fn run_streaming_loop(
     output_dir: &PathBuf,
     max_steps: usize,
     shutdown: &Arc<AtomicBool>,
+    start_step: usize,
+    optimizer_name: &str,
+    model_size: &str,
 ) -> Result<()> {
     let vocab_size = model.config().vocab_size;
-    let mut global_step: usize = 0;
+    let mut global_step: usize = start_step;
+    let mut log = TrainingLog {
+        optimizer: optimizer_name.to_string(),
+        model_size: model_size.to_string(),
+        steps: Vec::new(),
+    };
+    let log_path = format!("{}/training_log.json", output_dir.display());
+
+    if start_step > 0 {
+        if let Ok(data) = std::fs::read_to_string(&log_path) {
+            if let Ok(existing) = serde_json::from_str::<TrainingLog>(&data) {
+                log.steps = existing.steps;
+            }
+        }
+    }
 
     let start = Instant::now();
 
@@ -400,6 +460,7 @@ fn run_streaming_loop(
                     let path = format!("{}/checkpoint-emergency-step{}.safetensors",
                         output_dir.display(), global_step);
                     varmap.save(&path)?;
+                    save_log(&log, &log_path)?;
                     println!("\n  Emergency checkpoint saved: {}", path);
                     return Ok(());
                 }
@@ -423,6 +484,8 @@ fn run_streaming_loop(
                 epoch_count += 1;
                 global_step += 1;
 
+                log.steps.push(StepLog { step: global_step, loss: loss_val });
+
                 if batch_idx % 50 == 0 {
                     pb.set_message(format!("loss: {:.4}", epoch_loss / epoch_count as f32));
                 }
@@ -432,6 +495,7 @@ fn run_streaming_loop(
                     let path = format!("{}/checkpoint-{}.safetensors",
                         output_dir.display(), global_step);
                     varmap.save(&path)?;
+                    save_log(&log, &log_path)?;
                     pb.println(format!("  Checkpoint saved: {}", path));
                 }
             }
@@ -448,10 +512,11 @@ fn run_streaming_loop(
         println!("  Epoch {}/{}: loss={:.4} ppl={:.2} ({} chunks, {} steps)",
             epoch + 1, epochs, avg, ppl, chunk_idx, epoch_count);
 
-        // Epoch checkpoint
+        // Epoch checkpoint + log
         let path = format!("{}/checkpoint-epoch{}.safetensors",
             output_dir.display(), epoch + 1);
         varmap.save(&path)?;
+        save_log(&log, &log_path)?;
         println!("  Epoch checkpoint: {}", path);
 
         if max_steps > 0 && global_step >= max_steps {
@@ -462,8 +527,10 @@ fn run_streaming_loop(
 
     let final_path = format!("{}/checkpoint-final.safetensors", output_dir.display());
     varmap.save(&final_path)?;
+    save_log(&log, &log_path)?;
     println!("\n=== Training Complete ===");
     println!("  Final checkpoint: {}", final_path);
+    println!("  Training log: {}", log_path);
     println!("  Total steps: {}", global_step);
     println!("  Total time: {:.1}s", start.elapsed().as_secs_f64());
 
@@ -540,6 +607,34 @@ fn compute_logits_entropy(logits: &Tensor, vocab_size: usize) -> Result<f64> {
     let normalized = (entropy / max_entropy)?;
     let mean = normalized.mean_all()?.to_scalar::<f32>()? as f64;
     Ok(mean)
+}
+
+/// Extract step number from checkpoint filename.
+/// e.g. "checkpoint-50.safetensors" → 50, "checkpoint-emergency-step1234.safetensors" → 1234
+fn detect_step_from_path(path: &PathBuf) -> usize {
+    let stem = path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+
+    // Try "checkpoint-{N}" pattern
+    if let Some(rest) = stem.strip_prefix("checkpoint-") {
+        if let Ok(n) = rest.parse::<usize>() {
+            return n;
+        }
+        // Try "checkpoint-emergency-step{N}"
+        if let Some(step_str) = rest.strip_prefix("emergency-step") {
+            if let Ok(n) = step_str.parse::<usize>() {
+                return n;
+            }
+        }
+    }
+    0
+}
+
+fn save_log(log: &TrainingLog, path: &str) -> Result<()> {
+    let json = serde_json::to_string_pretty(log)?;
+    std::fs::write(path, json)?;
+    Ok(())
 }
 
 fn detect_format(path: &PathBuf) -> String {
