@@ -47,3 +47,12 @@ Desktop.ini
 *.tmp
 *.bak
 *.cache
+
+# Dev/setup notes (not part of the project)
+setup-env*
+setup-msvc*
+setup-windows*
+[Ss][Ee][Tt][Uu][Pp].md
+[Qq][Uu][Ii][Cc][Kk]-[Ff][Ii][Xx]*
+[Mm][Ii][Gg][Rr][Aa][Tt][Ii][Oo][Nn]*
+[Ww][Oo][Rr][Kk][Ii][Nn][Gg]-[Ss][Ee][Tt][Uu][Pp]*
