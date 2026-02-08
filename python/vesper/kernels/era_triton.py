@@ -32,7 +32,7 @@ def _era_forward_kernel(
     # 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     x3 = x * x * x
     inner = 0.7978845608028654 * (x + 0.044715 * x3)  # sqrt(2/pi)
-    tanh_inner = tl.math.tanh(inner)
+    tanh_inner = tl.extra.cuda.libdevice.tanh(inner)
     gelu = 0.5 * x * (1.0 + tanh_inner)
 
     # softplus(x) = log(1 + exp(x)), numerically stable
@@ -62,7 +62,7 @@ def _era_backward_kernel(
     # d(GELU)/dx (tanh approximation derivative)
     x3 = x * x * x
     inner = 0.7978845608028654 * (x + 0.044715 * x3)
-    tanh_inner = tl.math.tanh(inner)
+    tanh_inner = tl.extra.cuda.libdevice.tanh(inner)
     sech2 = 1.0 - tanh_inner * tanh_inner
     d_inner = 0.7978845608028654 * (1.0 + 3.0 * 0.044715 * x * x)
     d_gelu = 0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * d_inner
