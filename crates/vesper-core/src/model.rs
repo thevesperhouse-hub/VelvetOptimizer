@@ -3,7 +3,7 @@
 //! Transformer architecture with FlyLoRA and ERA activation
 
 use candle_core::{D, DType, Module, Result, Tensor, Var};
-use candle_nn::{embedding, Embedding, Init, Linear, VarBuilder};
+use candle_nn::{embedding, Embedding, Init, LayerNorm, Linear, VarBuilder};
 
 use crate::attention::MultiHeadAttention;
 use crate::config::VesperConfig;
@@ -320,8 +320,8 @@ enum FFNLayer {
 struct TransformerLayer {
     attention: MultiHeadAttention,
     ffn: FFNLayer,
-    attention_norm: TrainLayerNorm,
-    ffn_norm: TrainLayerNorm,
+    attention_norm: LayerNorm,
+    ffn_norm: LayerNorm,
 }
 
 impl TransformerLayer {
@@ -340,13 +340,14 @@ impl TransformerLayer {
             FFNLayer::Standard(FeedForward::new(config, vb.pp("ffn"))?)
         };
 
-        let attention_norm = TrainLayerNorm::new(
+        // Fused LayerNorm (memory efficient). Gradients bypass these via residual connections.
+        let attention_norm = candle_nn::layer_norm(
             config.hidden_size,
             config.layer_norm_eps,
             vb.pp("attention_norm"),
         )?;
 
-        let ffn_norm = TrainLayerNorm::new(
+        let ffn_norm = candle_nn::layer_norm(
             config.hidden_size,
             config.layer_norm_eps,
             vb.pp("ffn_norm"),
