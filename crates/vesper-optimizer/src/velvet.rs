@@ -3,7 +3,7 @@
 //! High-performance optimizer with adaptive features
 //! Utilise les kernels CUDA custom quand disponible
 
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{backprop::GradStore, DType, Device, Result, Tensor};
 use candle_nn::VarMap;
 use std::collections::HashMap;
 
@@ -254,6 +254,73 @@ impl VelvetOptimizer {
                 self.update_param(name, &mut param_tensor, &grad)?;
                 // On CUDA: kernel updated shared storage in-place, set() is no-op
                 // On CPU: optimizer created new tensor, set() writes it back
+                let _ = var.set(&param_tensor);
+            }
+        }
+        Ok(())
+    }
+
+    /// Step using pre-computed gradients from multiple GradStores.
+    /// Used by gradient checkpointing where backward() is called per-segment.
+    /// Each parameter appears in exactly one GradStore (segments have disjoint params).
+    /// Applies global gradient clipping across all stores before updating.
+    pub fn backward_step_from_grad_stores(
+        &mut self,
+        grad_stores: &[GradStore],
+        varmap: &VarMap,
+    ) -> Result<()> {
+        self.step += 1;
+        let data = varmap.data().lock().unwrap();
+
+        // Pass 1: compute global gradient norm across ALL GradStores
+        let clip_coef = if self.config.max_grad_norm > 0.0 {
+            let mut total_norm_sq: Option<Tensor> = None;
+            for (_name, var) in data.iter() {
+                for gs in grad_stores.iter() {
+                    if let Some(grad) = gs.get(var.as_tensor()) {
+                        let sq_sum = grad.sqr()?.sum_all()?;
+                        total_norm_sq = Some(match total_norm_sq {
+                            Some(acc) => acc.add(&sq_sum)?,
+                            None => sq_sum,
+                        });
+                        break; // Each param in exactly one GradStore
+                    }
+                }
+            }
+            let global_norm = match &total_norm_sq {
+                Some(t) => (t.to_dtype(DType::F32)?.to_scalar::<f32>()? as f64).sqrt(),
+                None => 0.0,
+            };
+            self.last_grad_norm = global_norm;
+
+            if global_norm > self.config.max_grad_norm {
+                self.config.max_grad_norm / (global_norm + 1e-6)
+            } else {
+                1.0
+            }
+        } else {
+            self.last_grad_norm = 0.0;
+            1.0
+        };
+
+        // Pass 2: apply updates with clipped gradients
+        for (name, var) in data.iter() {
+            // Find this param's gradient in whichever GradStore contains it
+            let mut found_grad = None;
+            for gs in grad_stores.iter() {
+                if let Some(grad) = gs.get(var.as_tensor()) {
+                    found_grad = Some(grad.clone());
+                    break;
+                }
+            }
+            if let Some(grad) = found_grad {
+                let grad = if clip_coef < 1.0 {
+                    (grad * clip_coef)?
+                } else {
+                    grad
+                };
+                let mut param_tensor = var.as_tensor().detach();
+                self.update_param(name, &mut param_tensor, &grad)?;
                 let _ = var.set(&param_tensor);
             }
         }

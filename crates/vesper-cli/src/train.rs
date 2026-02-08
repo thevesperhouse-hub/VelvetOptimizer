@@ -17,7 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use vesper_core::{VesperConfig, VesperLM, MappedDataset};
+use candle_core::backprop::GradStore;
+use vesper_core::{VesperConfig, VesperLM, CheckpointData, MappedDataset};
 use vesper_optimizer::{VelvetOptimizer, VelvetConfig};
 use vesper_training::{DatasetLoader, StreamingTextLoader};
 
@@ -72,6 +73,101 @@ impl OptimizerKind {
         Ok(())
     }
 
+    /// Checkpointed training step: multi-phase backward through segments.
+    /// Returns loss_val.
+    fn step_checkpointed(
+        &mut self,
+        model: &VesperLM,
+        checkpoint_data: &CheckpointData,
+        labels: &Tensor,
+        input_ids: &Tensor,
+        varmap: &VarMap,
+        vocab_size: usize,
+    ) -> Result<f32> {
+        match self {
+            OptimizerKind::Velvet(opt) => {
+                let logits = &checkpoint_data.logits;
+
+                // Compute real loss from logits
+                let mut loss = compute_loss(logits, labels)?;
+                if let Some(ref aux) = checkpoint_data.last_segment_aux_loss {
+                    loss = loss.add(&(aux.clone() * model.config().moe_aux_loss_weight)?)?;
+                }
+                let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+
+                // Entropy-Adaptive LR + Perplexity-Guided Momentum
+                let current_entropy = compute_logits_entropy(logits, vocab_size)?;
+                let entropy_scale = (current_entropy / 0.5).clamp(0.5, 2.0);
+                opt.set_entropy_scale(entropy_scale);
+                let current_ppl = (loss_val as f64).exp();
+                let ppl_scale = (40.0 / current_ppl.max(1.0)).clamp(0.5, 2.0);
+                opt.set_perplexity_scale(ppl_scale);
+
+                // Phase 1: backward on real loss (last segment)
+                let grad_store_last = loss.backward()
+                    .map_err(|e| anyhow::anyhow!("Backward failed: {}", e))?;
+
+                let num_segments = checkpoint_data.segment_ranges.len();
+                let mut all_grad_stores: Vec<GradStore> = Vec::with_capacity(num_segments);
+
+                // Extract upstream gradient from last segment's boundary Var
+                let mut upstream_grad: Option<Tensor> = if num_segments > 1 {
+                    let last_boundary = checkpoint_data.boundary_vars[num_segments - 1].as_tensor();
+                    grad_store_last.get(last_boundary).map(|g| g.clone())
+                } else {
+                    None
+                };
+                all_grad_stores.push(grad_store_last);
+
+                // Phase 2: backward on earlier segments (reverse order)
+                for seg_idx in (0..num_segments - 1).rev() {
+                    let ug = upstream_grad.take().ok_or_else(|| {
+                        anyhow::anyhow!("No upstream gradient for segment {} boundary", seg_idx + 1)
+                    })?;
+
+                    // Recompute this segment's forward pass
+                    let (recomputed_output, recomputed_aux) = model.recompute_segment(
+                        seg_idx, input_ids, &checkpoint_data.boundary_vars,
+                        checkpoint_data.mask_4d.as_ref(), &checkpoint_data.segment_ranges,
+                    ).map_err(|e| anyhow::anyhow!("Recompute segment {} failed: {}", seg_idx, e))?;
+
+                    // Proxy loss: (output * upstream_grad).sum_all()
+                    let mut proxy_loss = recomputed_output.mul(&ug)?.sum_all()?;
+
+                    // Add MoE aux_loss from this recomputed segment
+                    if let Some(aux) = recomputed_aux {
+                        proxy_loss = proxy_loss.add(
+                            &(aux * model.config().moe_aux_loss_weight)?,
+                        )?;
+                    }
+
+                    let grad_store_seg = proxy_loss.backward()
+                        .map_err(|e| anyhow::anyhow!("Backward segment {} failed: {}", seg_idx, e))?;
+
+                    // Extract upstream gradient for the previous segment
+                    if seg_idx > 0 {
+                        let boundary = checkpoint_data.boundary_vars[seg_idx].as_tensor();
+                        upstream_grad = grad_store_seg.get(boundary).map(|g| g.clone());
+                    }
+
+                    all_grad_stores.push(grad_store_seg);
+                }
+
+                // Phase 3: optimizer step with all collected gradients
+                opt.backward_step_from_grad_stores(&all_grad_stores, varmap)
+                    .map_err(|e| anyhow::anyhow!("Optimizer step failed: {}", e))?;
+
+                Ok(loss_val)
+            }
+            OptimizerKind::AdamW(_) => {
+                anyhow::bail!(
+                    "Gradient checkpointing is only supported with the Velvet optimizer. \
+                     Use --optimizer velvet."
+                );
+            }
+        }
+    }
+
     fn name(&self) -> &str {
         match self {
             OptimizerKind::Velvet(_) => "Velvet",
@@ -103,6 +199,7 @@ pub fn run(
     num_experts: usize,
     top_k: usize,
     dtype_str: String,
+    gradient_checkpointing: usize,
 ) -> Result<()> {
     println!("\n=== VesperAI Training ===\n");
 
@@ -137,6 +234,10 @@ pub fn run(
     };
     // Apply --moe flag (overrides preset if both specified)
     let config = if moe { config.with_moe(num_experts, top_k) } else { config };
+    // Apply gradient checkpointing
+    let config = if gradient_checkpointing > 0 {
+        config.with_gradient_checkpointing(gradient_checkpointing)
+    } else { config };
     // 3. Resolve tokenizer ("auto" picks based on model size)
     let resolved_tokenizer = resolve_tokenizer(&tokenizer_name, &model_size);
     let tok = tokenizer::load_tokenizer(&resolved_tokenizer)?;
@@ -206,6 +307,11 @@ pub fn run(
         _ => anyhow::bail!("Unknown optimizer: {}. Use: velvet, adamw", optimizer_name),
     };
     println!("  Optimizer: {}", optimizer.name());
+    if config.gradient_checkpoint_segments > 0 {
+        let segs = config.gradient_checkpoint_segments;
+        let lps = (config.num_layers + segs - 1) / segs;
+        println!("  Gradient checkpointing: {} segments ({} layers each)", segs, lps);
+    }
 
     // 6. Route to appropriate training mode
     std::fs::create_dir_all(&output_dir)?;
@@ -363,18 +469,23 @@ fn run_training_loop(
                 }
             };
 
-            // Forward
-            let (logits, aux_loss_opt) = model.forward(&input_ids, Some(&attention_mask))?;
-            let mut loss = compute_loss(&logits, &labels)?;
-
-            // Add MoE auxiliary loss if present
-            if let Some(aux_loss) = aux_loss_opt {
-                loss = loss.add(&(aux_loss * model.config().moe_aux_loss_weight)?)?;
+            // Forward + backward + optimizer step
+            let loss_val: f32;
+            if model.config().gradient_checkpoint_segments > 0 {
+                let ckpt = model.forward_checkpointed(&input_ids, Some(&attention_mask))
+                    .map_err(|e| anyhow::anyhow!("Checkpointed forward failed: {}", e))?;
+                loss_val = optimizer.step_checkpointed(
+                    model, &ckpt, &labels, &input_ids, varmap, vocab_size,
+                )?;
+            } else {
+                let (logits, aux_loss_opt) = model.forward(&input_ids, Some(&attention_mask))?;
+                let mut loss = compute_loss(&logits, &labels)?;
+                if let Some(aux_loss) = aux_loss_opt {
+                    loss = loss.add(&(aux_loss * model.config().moe_aux_loss_weight)?)?;
+                }
+                loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+                optimizer.step(&loss, varmap, &logits, loss_val, vocab_size)?;
             }
-            let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-
-            // Backward + optimizer step
-            optimizer.step(&loss, varmap, &logits, loss_val, vocab_size)?;
 
             epoch_loss += loss_val;
             count += 1;
@@ -502,14 +613,22 @@ fn run_streaming_loop(
                 let (input_ids, attention_mask, labels) =
                     prepare_batch_inmemory(&chunk_dataset, s, e, device)?;
 
-                let (logits, aux_loss_opt) = model.forward(&input_ids, Some(&attention_mask))?;
-                let mut loss = compute_loss(&logits, &labels)?;
-                if let Some(aux_loss) = aux_loss_opt {
-                    loss = loss.add(&(aux_loss * model.config().moe_aux_loss_weight)?)?;
+                let loss_val: f32;
+                if model.config().gradient_checkpoint_segments > 0 {
+                    let ckpt = model.forward_checkpointed(&input_ids, Some(&attention_mask))
+                        .map_err(|e| anyhow::anyhow!("Checkpointed forward failed: {}", e))?;
+                    loss_val = optimizer.step_checkpointed(
+                        model, &ckpt, &labels, &input_ids, varmap, vocab_size,
+                    )?;
+                } else {
+                    let (logits, aux_loss_opt) = model.forward(&input_ids, Some(&attention_mask))?;
+                    let mut loss = compute_loss(&logits, &labels)?;
+                    if let Some(aux_loss) = aux_loss_opt {
+                        loss = loss.add(&(aux_loss * model.config().moe_aux_loss_weight)?)?;
+                    }
+                    loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+                    optimizer.step(&loss, varmap, &logits, loss_val, vocab_size)?;
                 }
-                let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-
-                optimizer.step(&loss, varmap, &logits, loss_val, vocab_size)?;
 
                 epoch_loss += loss_val;
                 epoch_count += 1;

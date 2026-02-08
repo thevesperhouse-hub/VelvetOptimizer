@@ -35,6 +35,10 @@ pub struct VesperConfig {
     pub moe_num_experts: usize,
     pub moe_top_k: usize,
     pub moe_aux_loss_weight: f64,
+
+    // Gradient checkpointing: split layers into N segments, recompute during backward.
+    // 0 = disabled, recommended: 4 or 6 for 24-layer models.
+    pub gradient_checkpoint_segments: usize,
 }
 
 impl Default for VesperConfig {
@@ -69,6 +73,9 @@ impl Default for VesperConfig {
             moe_num_experts: 8,
             moe_top_k: 2,
             moe_aux_loss_weight: 0.01,
+
+            // Gradient checkpointing (disabled)
+            gradient_checkpoint_segments: 0,
         }
     }
 }
@@ -174,6 +181,12 @@ impl VesperConfig {
         self
     }
 
+    /// Builder: enable gradient checkpointing with N segments
+    pub fn with_gradient_checkpointing(mut self, segments: usize) -> Self {
+        self.gradient_checkpoint_segments = segments;
+        self
+    }
+
     /// Calculate total parameters (approximate)
     pub fn total_params(&self) -> usize {
         let embedding_params = self.vocab_size * self.hidden_size;
@@ -224,6 +237,14 @@ impl VesperConfig {
             if self.moe_num_experts < 2 {
                 anyhow::bail!("moe_num_experts must be at least 2");
             }
+        }
+
+        if self.gradient_checkpoint_segments > self.num_layers {
+            anyhow::bail!(
+                "gradient_checkpoint_segments ({}) must be <= num_layers ({})",
+                self.gradient_checkpoint_segments,
+                self.num_layers
+            );
         }
 
         Ok(())

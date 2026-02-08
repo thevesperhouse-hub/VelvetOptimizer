@@ -12,7 +12,7 @@ pub mod moe;
 pub mod dataset_cache;
 
 pub use config::VesperConfig;
-pub use model::VesperLM;
+pub use model::{VesperLM, CheckpointData};
 pub use flylora::FlyLoRALinear;
 pub use era::ERAActivation;
 pub use moe::{MoELayer, ExpertFFN};

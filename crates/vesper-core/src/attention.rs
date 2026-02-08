@@ -114,30 +114,44 @@ impl MultiHeadAttention {
             .reshape((batch_size, seq_len, self.hidden_size))
     }
 
+    /// Rotary Position Embedding (RoPE) — LLaMA-style split-half rotation.
+    ///
+    /// For each head, splits head_dim into two halves and applies:
+    ///   rotated_x1 = x1 * cos(θ) - x2 * sin(θ)
+    ///   rotated_x2 = x2 * cos(θ) + x1 * sin(θ)
+    /// where θ_i = position / (rope_theta^(2i/d))
     fn apply_rope(&self, x: &Tensor, seq_len: usize) -> Result<Tensor> {
         let (_batch, _heads, _seq, head_dim) = x.dims4()?;
-        
-        // Simple RoPE implementation
         let device = x.device();
+        let half_dim = head_dim / 2;
+
+        // Inverse frequencies: inv_freq[i] = 1 / (theta^(2i/d))
+        let inv_freq: Vec<f32> = (0..half_dim)
+            .map(|i| 1.0 / (self._rope_theta as f32).powf(2.0 * i as f32 / head_dim as f32))
+            .collect();
+        let inv_freq = Tensor::from_vec(inv_freq, half_dim, device)?;
+
+        // Positions: [0, 1, ..., seq_len-1]
         let positions: Vec<f32> = (0..seq_len).map(|i| i as f32).collect();
         let positions = Tensor::from_vec(positions, seq_len, device)?;
 
-        // Calculate frequencies
-        let dim_indices: Vec<f32> = (0..head_dim / 2)
-            .map(|i| 2.0 * i as f32 / head_dim as f32)
-            .collect();
-        let dim_indices = Tensor::from_vec(dim_indices, head_dim / 2, device)?;
-        
-        let freqs = positions
-            .unsqueeze(1)?
-            .broadcast_mul(&dim_indices.unsqueeze(0)?)?;
-        
-        let _cos = freqs.cos()?;
-        let _sin = freqs.sin()?;
+        // Angles: [seq_len, half_dim] = outer product(positions, inv_freq)
+        let angles = positions.unsqueeze(1)?.broadcast_mul(&inv_freq.unsqueeze(0)?)?;
 
-        // Apply rotation (simplified - real implementation would be more complex)
-        // For now, return input unchanged (RoPE full implementation requires complex slicing)
-        Ok(x.clone())
+        // cos/sin → [1, 1, seq_len, half_dim] for broadcasting over (batch, heads)
+        let cos = angles.cos()?.unsqueeze(0)?.unsqueeze(0)?.to_dtype(x.dtype())?;
+        let sin = angles.sin()?.unsqueeze(0)?.unsqueeze(0)?.to_dtype(x.dtype())?;
+
+        // Split head_dim into two halves
+        let x1 = x.narrow(3, 0, half_dim)?.contiguous()?;
+        let x2 = x.narrow(3, half_dim, half_dim)?.contiguous()?;
+
+        // Apply rotation
+        let rotated_x1 = x1.broadcast_mul(&cos)?.sub(&x2.broadcast_mul(&sin)?)?;
+        let rotated_x2 = x2.broadcast_mul(&cos)?.add(&x1.broadcast_mul(&sin)?)?;
+
+        // Concatenate halves back
+        Tensor::cat(&[&rotated_x1, &rotated_x2], 3)
     }
 
     fn create_causal_mask(&self, seq_len: usize, device: &Device, dtype: DType) -> Result<Tensor> {

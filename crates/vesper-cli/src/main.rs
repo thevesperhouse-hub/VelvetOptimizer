@@ -115,6 +115,11 @@ enum Commands {
         /// Data type: f32, bf16, f16
         #[arg(long, default_value = "bf16")]
         dtype: String,
+
+        /// Gradient checkpointing: split layers into N segments (0=disabled).
+        /// Reduces activation memory at ~25% more compute. Recommended: 4 or 6.
+        #[arg(long, default_value = "0")]
+        gradient_checkpointing: usize,
     },
 
     /// Benchmark Velvet optimizer vs AdamW
@@ -234,6 +239,7 @@ fn main() -> anyhow::Result<()> {
             save_every, output_dir, max_steps, vocab_size,
             cache, streaming, chunk_mb, optimizer, resume,
             moe, num_experts, top_k, dtype,
+            gradient_checkpointing,
         } => {
             train::run(
                 dataset, format, tokenizer, model_size,
@@ -241,6 +247,7 @@ fn main() -> anyhow::Result<()> {
                 save_every, output_dir, max_steps, vocab_size,
                 cache, streaming, chunk_mb, optimizer, resume,
                 moe, num_experts, top_k, dtype,
+                gradient_checkpointing,
             )?;
         }
 
