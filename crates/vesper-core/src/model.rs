@@ -20,10 +20,11 @@ pub struct CheckpointData {
     pub mask_4d: Option<Tensor>,
     /// Layer ranges per segment: (start_inclusive, end_exclusive).
     pub segment_ranges: Vec<(usize, usize)>,
-    /// Logits from the last segment (live computation graph attached).
-    pub logits: Tensor,
-    /// MoE aux_loss from the last segment only (live graph).
-    pub last_segment_aux_loss: Option<Tensor>,
+    /// Raw output of the last segment (before final_norm + lm_head), detached.
+    /// Used as input to forward_head during backward phase.
+    pub last_hidden: Tensor,
+    /// MoE aux_loss sum from all segments (detached, for logging only).
+    pub total_aux_loss: Option<Tensor>,
 }
 
 pub struct VesperLM {
@@ -122,6 +123,8 @@ impl VesperLM {
         // boundary_vars[0] = Var wrapping embedding output
         let mut boundary_vars: Vec<Var> = vec![Var::from_tensor(&embedded)?];
 
+        let mut total_aux: Option<Tensor> = None;
+
         for (seg_idx, &(layer_start, layer_end)) in segment_ranges.iter().enumerate() {
             let is_last = seg_idx == actual_segments - 1;
             let seg_input = boundary_vars[seg_idx].as_tensor();
@@ -130,17 +133,23 @@ impl VesperLM {
                 seg_input, mask_4d.as_ref(), layer_start, layer_end,
             )?;
 
-            if is_last {
-                // Last segment: keep live graph for real loss backward
-                let normed = self.final_norm.forward(&seg_output)?;
-                let logits = self.lm_head.forward(&normed)?;
+            // Accumulate aux_loss (detached, for logging only)
+            if let Some(a) = seg_aux {
+                let a_det = a.detach();
+                total_aux = Some(match total_aux {
+                    Some(acc) => acc.add(&a_det)?,
+                    None => a_det,
+                });
+            }
 
+            if is_last {
+                // Save last hidden (detached) — backward phase will recompute
                 return Ok(CheckpointData {
                     boundary_vars,
                     mask_4d,
                     segment_ranges,
-                    logits,
-                    last_segment_aux_loss: seg_aux,
+                    last_hidden: seg_output.detach(),
+                    total_aux_loss: total_aux,
                 });
             } else {
                 // Non-last: copy data into a new Var, freeing this segment's activations
