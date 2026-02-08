@@ -146,8 +146,8 @@ impl OptimizerKind {
                         layer_idx, &input, mask_4d.as_ref(),
                     ).map_err(|e| anyhow::anyhow!("Recompute layer {} failed: {}", layer_idx, e))?;
 
-                    // Proxy loss: d(proxy)/d(output) = upstream, so backward gives correct param grads
-                    let mut proxy_loss = output.mul(&upstream.detach())?.sum_all()?;
+                    // Proxy loss in F32 for numerical stability (BF16 sum over millions of elements loses precision)
+                    let mut proxy_loss = output.to_dtype(DType::F32)?.mul(&upstream.detach().to_dtype(DType::F32)?)?.sum_all()?;
                     if let Some(a) = aux {
                         proxy_loss = proxy_loss.add(&(a * aux_weight)?)?;
                     }
@@ -918,7 +918,8 @@ fn prepare_batch_cached(
 
 fn compute_loss(logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
     let (batch_size, seq_len, vocab_size) = logits.dims3()?;
-    let logits_2d = logits.reshape((batch_size * seq_len, vocab_size))?;
+    // F32 for numerical stability: BF16 softmax over 128K vocab causes NaN
+    let logits_2d = logits.to_dtype(DType::F32)?.reshape((batch_size * seq_len, vocab_size))?;
     let labels_1d = labels.flatten_all()?;
     cross_entropy(&logits_2d, &labels_1d)
         .map_err(|e| anyhow::anyhow!("Cross entropy failed: {}", e))

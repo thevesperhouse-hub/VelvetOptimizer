@@ -13,6 +13,11 @@ mod benchmark;
 mod generate;
 mod cache;
 
+#[cfg(feature = "tch-backend")]
+mod tch_model;
+#[cfg(feature = "tch-backend")]
+mod tch_train;
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -120,6 +125,12 @@ enum Commands {
         /// Reduces activation memory at ~25% more compute. Recommended: 4 or 6.
         #[arg(long, default_value = "0")]
         gradient_checkpointing: usize,
+
+        /// Backend: candle (default) or tch (PyTorch/LibTorch).
+        /// tch requires --features tch-backend at build time.
+        /// Use tch for large-scale training (batch 64+ on GPU).
+        #[arg(long, default_value = "candle")]
+        backend: String,
     },
 
     /// Benchmark Velvet optimizer vs AdamW
@@ -239,16 +250,37 @@ fn main() -> anyhow::Result<()> {
             save_every, output_dir, max_steps, vocab_size,
             cache, streaming, chunk_mb, optimizer, resume,
             moe, num_experts, top_k, dtype,
-            gradient_checkpointing,
+            gradient_checkpointing, backend,
         } => {
-            train::run(
-                dataset, format, tokenizer, model_size,
-                epochs, batch_size, lr, seq_len,
-                save_every, output_dir, max_steps, vocab_size,
-                cache, streaming, chunk_mb, optimizer, resume,
-                moe, num_experts, top_k, dtype,
-                gradient_checkpointing,
-            )?;
+            if backend == "tch" {
+                #[cfg(feature = "tch-backend")]
+                {
+                    tch_train::run(
+                        dataset, format, tokenizer, model_size,
+                        epochs, batch_size, lr, seq_len,
+                        save_every, output_dir, max_steps, vocab_size,
+                        cache, streaming, chunk_mb, optimizer, resume,
+                        moe, num_experts, top_k, dtype,
+                    )?;
+                }
+                #[cfg(not(feature = "tch-backend"))]
+                {
+                    anyhow::bail!(
+                        "tch backend not compiled. Rebuild with:\n  \
+                         cargo build --release -p vesper-cli --features tch-backend\n  \
+                         Requires: pip install torch && export LIBTORCH_USE_PYTORCH=1"
+                    );
+                }
+            } else {
+                train::run(
+                    dataset, format, tokenizer, model_size,
+                    epochs, batch_size, lr, seq_len,
+                    save_every, output_dir, max_steps, vocab_size,
+                    cache, streaming, chunk_mb, optimizer, resume,
+                    moe, num_experts, top_k, dtype,
+                    gradient_checkpointing,
+                )?;
+            }
         }
 
         Commands::Benchmark {

@@ -1,0 +1,20 @@
+# VesperLM Python Training Framework
+# Install: pip install -r requirements.txt
+
+# PyTorch with CUDA 12.8 — MUST use the CUDA index
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch>=2.10.0
+
+# Triton (GPU kernel compiler — Linux only, auto-included with torch on Linux)
+triton>=3.6.0
+
+# Flash Attention 2 (requires CUDA, pip install flash-attn --no-build-isolation)
+flash-attn>=2.8.3
+
+# Tokenizers
+tokenizers>=0.22.2
+huggingface-hub>=1.4.1
+
+# Utilities
+tqdm
+wandb

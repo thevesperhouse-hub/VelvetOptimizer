@@ -32,3 +32,12 @@ tokenizers = "0.15"
 hf-hub = "0.3"
 toml = "0.8"
 ctrlc = { version = "3.4", features = ["termination"] }
+
+# tch-rs (PyTorch/LibTorch backend) — optional, for efficient GPU training
+# Build with: cargo build --features tch-backend
+# Requires: LIBTORCH_USE_PYTORCH=1 or LIBTORCH env var
+tch = { version = "0.16", optional = true }
+
+[features]
+default = []
+tch-backend = ["dep:tch"]

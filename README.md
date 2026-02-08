@@ -2,27 +2,43 @@
 
 [![License: Proprietary](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.83+-orange.svg)](https://www.rust-lang.org/)
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org/)
 [![CUDA](https://img.shields.io/badge/CUDA-12.8-green.svg)](https://developer.nvidia.com/cuda-toolkit)
-[![Candle](https://img.shields.io/badge/Candle-0.9.1-blue.svg)](https://github.com/huggingface/candle)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.10-ee4c2c.svg)](https://pytorch.org/)
 
-> High-performance LLM training framework in pure Rust with a custom optimizer, Mixture of Experts, and CUDA kernels.
+> High-performance LLM training framework with a custom optimizer, Mixture of Experts, and CUDA/Triton kernels. Available in **Rust** (Candle/tch-rs) and **Python** (PyTorch).
 
 VelvetOptimizer is a from-scratch transformer training system built around the **Velvet optimizer** — an enhanced AdamW with entropy-adaptive learning rate, perplexity-guided momentum, and custom CUDA kernels. It includes **VesperLM**, a transformer architecture with FlyLoRA (sparse low-rank adaptation), ERA activation, and Mixture of Experts (MoE).
+
+### Training Backends
+
+| Backend | Language | Status | Best For |
+|---------|----------|--------|----------|
+| **Python/PyTorch** | Python | Production | Large-scale GPU training (recommended) |
+| **tch-rs** | Rust | Production | Rust-native training with PyTorch autograd |
+| **Candle** | Rust | Development | CPU/small models, inference |
+
+> **Why multiple backends?** Candle's autograd retains ALL intermediate tensors until backward completes (~70GB VRAM for batch 10 on a 1B model). PyTorch frees intermediates progressively during backward, enabling batch 64+ on the same hardware. The Python and tch-rs backends use PyTorch's autograd for memory-efficient GPU training.
 
 ---
 
 ## Features
 
-- **Velvet Optimizer** — AdamW + entropy-adaptive LR + perplexity-guided momentum + sparse awareness + custom CUDA kernels
+- **Velvet Optimizer** — AdamW + entropy-adaptive LR + perplexity-guided momentum + custom CUDA/Triton kernels
 - **VesperLM** — Transformer with multi-head attention, RoPE, FlyLoRA, ERA activation
 - **Mixture of Experts (MoE)** — Top-K routing, N expert FFNs per layer, Switch Transformer load balancing loss
-- **CLI Training** — `vesper train` with checkpointing, resume, SIGTERM auto-save
-- **Streaming** — Chunk-by-chunk training for large datasets (>1GB)
+- **Flash Attention 2** — via PyTorch SDPA (Python) or manual implementation (Rust)
+- **Triton Kernels** — Fused Velvet update, fused cross-entropy (Unsloth-style), fused ERA activation
+- **Gradient Checkpointing** — `torch.utils.checkpoint` (Python) or manual segment-based (Rust)
+- **Gradient Accumulation** — `--grad-accum N` for larger effective batch sizes
+- **CLI Training** — `vesper train` (Rust) or `python train.py` (Python) with checkpointing, resume, SIGTERM auto-save
+- **Streaming** — Chunk-by-chunk training for large datasets (>1GB), with multi-worker sharding
 - **Binary Cache** — Memory-mapped dataset cache for instant loading
+- **Wandb Integration** — `--wandb` for Weights & Biases experiment tracking (Python)
+- **Evaluation Loop** — `--val-dataset` for periodic validation (Python)
 - **Benchmarking** — `vesper benchmark` for Velvet vs AdamW comparison
 - **Text Generation** — `vesper generate` with temperature/top-p sampling
-- **Tauri Desktop App** — GUI for training and inference
-- **Cloud Ready** — Dockerfile + Vast.ai setup script for A100 training
+- **Cloud Ready** — Dockerfile + Vast.ai setup script for H100/A100 training
 
 ---
 
@@ -75,6 +91,40 @@ python scripts/download_fineweb.py --tokens 10M --output fineweb-10M.txt
   --model-size small \
   --moe --num-experts 8 --top-k 2 \
   --epochs 3
+```
+
+### Python Training (Recommended for GPU)
+
+```bash
+cd python/
+pip install -r requirements.txt    # PyTorch CUDA 12.8 + Triton + Flash Attn
+
+# Basic training
+python train.py --dataset data.txt --model-size medium --dtype bf16
+
+# Large-scale (1B params, H100)
+python train.py --dataset data.txt --model-size xlarge --dtype bf16 \
+  --gradient-checkpointing --batch-size 16 --grad-accum 4 \
+  --wandb --wandb-project vesper-1B
+
+# MoE with validation
+python train.py --dataset train.txt --val-dataset val.txt \
+  --model-size large --moe --num-experts 8 --top-k 2 --eval-every 500
+
+# Resume from checkpoint
+python train.py --dataset data.txt --model-size xlarge --resume checkpoints/step_5000.pt
+```
+
+### tch-rs Backend (Rust + PyTorch autograd)
+
+```bash
+# Server setup (Linux with PyTorch installed via pip)
+pip install torch
+export LIBTORCH_USE_PYTORCH=1
+cargo build --release -p vesper-cli --features tch-backend
+
+# Train with tch-rs backend
+./target/release/vesper train --backend tch --dataset data.txt --model-size xlarge --dtype bf16
 ```
 
 ### Benchmark (Velvet vs AdamW)
@@ -130,8 +180,23 @@ MoE multiplies FFN parameters by the number of experts, but only activates K exp
 
 ```
 VelvetOptimizer/
+├── python/                    # ★ Python training framework (recommended)
+│   ├── train.py               # CLI training script (argparse)
+│   ├── requirements.txt       # PyTorch CUDA 12.8 + Triton 3.6
+│   ├── setup.py               # pip install -e .
+│   └── vesper/
+│       ├── model.py           # VesperLM (Flash Attn 2, RoPE, FlyLoRA, MoE)
+│       ├── optimizer.py       # VelvetOptimizer (torch.optim.Optimizer)
+│       ├── config.py          # Model configs + presets
+│       ├── data.py            # Dataset (inmemory, streaming, cached, JSONL)
+│       └── kernels/
+│           ├── velvet_triton.py   # Fused optimizer update (Triton)
+│           ├── era_triton.py      # Fused ERA activation (Triton)
+│           ├── fused_ce.py        # Fused cross-entropy — Unsloth-style (Triton)
+│           └── velvet_cuda.py     # Native CUDA kernel (cpp_extension fallback)
+│
 ├── crates/
-│   ├── vesper-core/           # Model architecture
+│   ├── vesper-core/           # Model architecture (Candle)
 │   │   ├── model.rs           # VesperLM transformer
 │   │   ├── attention.rs       # Multi-head attention + RoPE
 │   │   ├── flylora.rs         # Sparse LoRA (75% param reduction)
@@ -150,7 +215,9 @@ VelvetOptimizer/
 │   │
 │   ├── vesper-cli/            # Command-line interface
 │   │   ├── main.rs            # CLI entry (train, benchmark, generate, cache)
-│   │   ├── train.rs           # Training pipeline (resume, SIGTERM, checkpointing)
+│   │   ├── train.rs           # Candle training pipeline
+│   │   ├── tch_model.rs       # ★ VesperLM in tch-rs (PyTorch autograd)
+│   │   ├── tch_train.rs       # ★ tch-rs training pipeline
 │   │   ├── benchmark.rs       # Velvet vs AdamW comparison
 │   │   ├── generate.rs        # Text generation
 │   │   └── cache.rs           # Dataset cache build/info
@@ -162,7 +229,7 @@ VelvetOptimizer/
 │   ├── download_fineweb.py    # FineWeb-Edu dataset downloader
 │   ├── plot_benchmark.py      # Benchmark visualization (4 graphs)
 │   ├── plot_training.py       # Training loss/perplexity curves
-│   └── vastai_setup.sh        # One-command Vast.ai A100 setup
+│   └── vastai_setup.sh        # One-command Vast.ai setup
 │
 └── Dockerfile                 # Multi-stage CUDA build for cloud
 ```
@@ -334,30 +401,48 @@ Requires: `pip install matplotlib numpy`
 
 | Component | Version | Role |
 |-----------|---------|------|
-| Rust | 1.83+ | Primary language |
-| Candle | 0.9.1 (EricLBuehler fork) | ML framework (tensors, autograd, CUDA) |
+| **Python** | 3.10+ | Primary training language |
+| **PyTorch** | 2.10+ | ML framework (tensors, autograd, CUDA) |
+| **Triton** | 3.6+ | GPU kernel compiler (fused kernels) |
+| **Flash Attention** | 2.8.3+ | Memory-efficient attention |
+| Rust | 1.83+ | Alternative backend, inference |
+| Candle | 0.9.1 (EricLBuehler fork) | Rust ML framework (small models, CPU) |
+| tch-rs | 0.16 | Rust PyTorch bindings (GPU training) |
 | CUDA Toolkit | 12.8 | GPU compute |
-| Clap | 4.x | CLI argument parsing |
-| SafeTensors | | Model checkpoint format |
+| Clap | 4.x | Rust CLI argument parsing |
+| Wandb | | Experiment tracking (optional) |
 | Tauri | 2.0 | Desktop app (optional) |
-| React + TypeScript | 18 / 5.3 | Frontend UI (optional) |
 
 ---
 
+## Memory & Backend Comparison
+
+| Model | Batch | Candle VRAM | PyTorch VRAM | Notes |
+|-------|-------|-------------|--------------|-------|
+| small (35M) | 4 | ~2GB | ~1GB | Both work fine |
+| medium (89M) | 8 | ~6GB | ~3GB | Candle OK on RTX 4080 |
+| large (350M) | 8 | ~25GB | ~8GB | Candle needs A100 |
+| xlarge (1B) | 10 | ~70GB | ~18GB | **Candle impractical** |
+| xlarge (1B) | 32 | OOM | ~45GB | PyTorch with grad ckpt |
+
+**Why PyTorch wins for large models**: Candle's tape-based autograd retains ALL intermediate tensors (attention scores, FFN activations, residuals) until `loss.backward()` completes. For a 24-layer 1B model, this means 24 layers worth of activations stay in VRAM simultaneously. PyTorch frees each layer's activations as soon as its gradients are computed during backward, keeping only ~1 layer's worth of intermediates at any time.
+
 ## System Requirements
 
-### Minimum (CPU training)
-- Rust 1.83+
-- 8GB RAM
-
-### Recommended (GPU training)
+### Python Training (Recommended)
+- Python 3.10+
 - NVIDIA GPU with 8GB+ VRAM (RTX 3060+)
 - CUDA Toolkit 12.8
+- `pip install -r python/requirements.txt`
+
+### Rust CLI
+- Rust 1.83+
+- CUDA Toolkit 12.8
+- For tch-rs backend: `pip install torch && export LIBTORCH_USE_PYTORCH=1`
 - Visual Studio Build Tools 2022 (Windows) or GCC (Linux)
-- 16GB+ RAM
 
 ### Cloud (large models)
-- NVIDIA A100 40/80GB
+- NVIDIA H100 80GB or A100 80GB
 - CUDA 12.4+
 - 64GB+ RAM
 
@@ -377,6 +462,15 @@ Requires: `pip install matplotlib numpy`
 ---
 
 ## Changelog
+
+### v0.4.0 (February 2026)
+- **Python training framework**: Complete PyTorch implementation with Flash Attn 2, Triton kernels
+- **Triton kernels**: Fused Velvet update, fused cross-entropy (Unsloth-style), fused ERA activation
+- **tch-rs backend**: Rust training via LibTorch/PyTorch autograd (feature-gated)
+- Gradient accumulation (`--grad-accum`)
+- Evaluation loop (`--val-dataset`, `--eval-every`)
+- Wandb integration (`--wandb`)
+- Multi-worker streaming dataset sharding
 
 ### v0.3.0 (February 2026)
 - Mixture of Experts (MoE): ExpertFFN, MoELayer, top-K routing, load balancing loss
@@ -402,7 +496,7 @@ Requires: `pip install matplotlib numpy`
 
 ---
 
-**Built with Rust | Powered by Candle | Accelerated by CUDA**
+**Built with Rust & Python | Powered by PyTorch & Candle | Accelerated by CUDA & Triton**
 
 Made by [The Vesper House](https://github.com/thevesperhouse-hub)
 
