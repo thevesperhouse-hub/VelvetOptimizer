@@ -176,6 +176,13 @@ impl VesperLM {
         }
     }
 
+    /// Apply final layer norm + language modeling head to hidden states.
+    /// Used by checkpointed backward to recompute logits from a segment's output.
+    pub fn forward_head(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        let normed = self.final_norm.forward(hidden_states)?;
+        self.lm_head.forward(&normed)
+    }
+
     pub fn config(&self) -> &VesperConfig {
         &self.config
     }

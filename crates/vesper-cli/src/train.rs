@@ -76,6 +76,9 @@ impl OptimizerKind {
 
     /// Checkpointed training step: multi-phase backward through segments.
     /// Returns loss_val.
+    ///
+    /// All segments (including the last) are recomputed during backward.
+    /// The CheckpointData's logits are only used for loss_val logging.
     fn step_checkpointed(
         &mut self,
         model: &VesperLM,
@@ -89,61 +92,57 @@ impl OptimizerKind {
             OptimizerKind::Velvet(opt) => {
                 let logits = &checkpoint_data.logits;
 
-                // Compute real loss from logits
-                let mut loss = compute_loss(logits, labels)?;
-                if let Some(ref aux) = checkpoint_data.last_segment_aux_loss {
-                    loss = loss.add(&(aux.clone() * model.config().moe_aux_loss_weight)?)?;
-                }
-                let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+                // Compute loss_val for logging (detached — we don't backward this)
+                let logits_detached = logits.detach();
+                let loss_detached = compute_loss(&logits_detached, labels)?;
+                let loss_val = loss_detached.to_dtype(DType::F32)?.to_scalar::<f32>()?;
 
                 // Entropy-Adaptive LR + Perplexity-Guided Momentum
-                let current_entropy = compute_logits_entropy(logits, vocab_size)?;
+                let current_entropy = compute_logits_entropy(&logits_detached, vocab_size)?;
                 let entropy_scale = (current_entropy / 0.5).clamp(0.5, 2.0);
                 opt.set_entropy_scale(entropy_scale);
                 let current_ppl = (loss_val as f64).exp();
                 let ppl_scale = (40.0 / current_ppl.max(1.0)).clamp(0.5, 2.0);
                 opt.set_perplexity_scale(ppl_scale);
 
-                // Phase 1: backward on real loss (last segment)
-                let grad_store_last = loss.backward()
-                    .map_err(|e| anyhow::anyhow!("Backward failed: {}", e))?;
-
                 let num_segments = checkpoint_data.segment_ranges.len();
                 let mut all_grad_stores: Vec<GradStore> = Vec::with_capacity(num_segments);
+                let mut upstream_grad: Option<Tensor> = None;
 
-                // Extract upstream gradient from last segment's boundary Var
-                let mut upstream_grad: Option<Tensor> = if num_segments > 1 {
-                    let last_boundary = checkpoint_data.boundary_vars[num_segments - 1].as_tensor();
-                    grad_store_last.get(last_boundary).map(|g| g.clone())
-                } else {
-                    None
-                };
-                all_grad_stores.push(grad_store_last);
-
-                // Phase 2: backward on earlier segments (reverse order)
-                for seg_idx in (0..num_segments - 1).rev() {
-                    let ug = upstream_grad.take().ok_or_else(|| {
-                        anyhow::anyhow!("No upstream gradient for segment {} boundary", seg_idx + 1)
-                    })?;
-
+                // Backward all segments in reverse (including last)
+                for seg_idx in (0..num_segments).rev() {
                     // Recompute this segment's forward pass
                     let (recomputed_output, recomputed_aux) = model.recompute_segment(
                         seg_idx, input_ids, &checkpoint_data.boundary_vars,
                         checkpoint_data.mask_4d.as_ref(), &checkpoint_data.segment_ranges,
                     ).map_err(|e| anyhow::anyhow!("Recompute segment {} failed: {}", seg_idx, e))?;
 
-                    // Proxy loss: (output * upstream_grad).sum_all()
-                    let mut proxy_loss = recomputed_output.mul(&ug)?.sum_all()?;
+                    let grad_store_seg;
 
-                    // Add MoE aux_loss from this recomputed segment
-                    if let Some(aux) = recomputed_aux {
-                        proxy_loss = proxy_loss.add(
-                            &(aux * model.config().moe_aux_loss_weight)?,
-                        )?;
+                    if seg_idx == num_segments - 1 {
+                        // Last segment: recompute head + real loss
+                        let recomputed_logits = model.forward_head(&recomputed_output)
+                            .map_err(|e| anyhow::anyhow!("Forward head failed: {}", e))?;
+                        let mut loss = compute_loss(&recomputed_logits, labels)?;
+                        if let Some(aux) = recomputed_aux {
+                            loss = loss.add(&(aux * model.config().moe_aux_loss_weight)?)?;
+                        }
+                        grad_store_seg = loss.backward()
+                            .map_err(|e| anyhow::anyhow!("Backward last segment failed: {}", e))?;
+                    } else {
+                        // Earlier segment: proxy loss
+                        let ug = upstream_grad.take().ok_or_else(|| {
+                            anyhow::anyhow!("No upstream gradient for segment {} boundary", seg_idx + 1)
+                        })?;
+                        let mut proxy_loss = recomputed_output.mul(&ug)?.sum_all()?;
+                        if let Some(aux) = recomputed_aux {
+                            proxy_loss = proxy_loss.add(
+                                &(aux * model.config().moe_aux_loss_weight)?,
+                            )?;
+                        }
+                        grad_store_seg = proxy_loss.backward()
+                            .map_err(|e| anyhow::anyhow!("Backward segment {} failed: {}", seg_idx, e))?;
                     }
-
-                    let grad_store_seg = proxy_loss.backward()
-                        .map_err(|e| anyhow::anyhow!("Backward segment {} failed: {}", seg_idx, e))?;
 
                     // Extract upstream gradient for the previous segment
                     if seg_idx > 0 {
@@ -154,7 +153,7 @@ impl OptimizerKind {
                     all_grad_stores.push(grad_store_seg);
                 }
 
-                // Phase 3: optimizer step with all collected gradients
+                // Optimizer step with all collected gradients
                 opt.backward_step_from_grad_stores(&all_grad_stores, varmap)
                     .map_err(|e| anyhow::anyhow!("Optimizer step failed: {}", e))?;
 
