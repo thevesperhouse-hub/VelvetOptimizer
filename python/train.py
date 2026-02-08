@@ -32,6 +32,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from vesper.config import VesperConfig
 from vesper.model import VesperLM
@@ -299,6 +300,11 @@ def train(args):
     trainable = model.num_parameters()
     print(f"  Trainable params: {trainable/1e6:.1f}M")
 
+    # Compile model for speed (PyTorch 2.x)
+    if not args.no_compile and hasattr(torch, "compile"):
+        print("  Compiling model with torch.compile()...")
+        model = torch.compile(model)
+
     # Optimizer
     optimizer = VelvetOptimizer(
         model.parameters(),
@@ -384,6 +390,15 @@ def train(args):
 
     print(f"\nStarting training from step {step}...\n")
 
+    pbar = tqdm(
+        total=args.max_steps,
+        initial=step,
+        desc="Training",
+        unit="step",
+        dynamic_ncols=True,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+    )
+
     while step < args.max_steps and not _SHOULD_STOP:
         epoch += 1
         data_iter = iter(dataloader)
@@ -434,12 +449,23 @@ def train(args):
             step += 1
             accum_loss = 0.0
 
-            # Logging
-            if step % args.log_every == 0:
-                elapsed = time.time() - start_time
-                tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0
-                ppl = math.exp(min(loss_val, 20.0))
+            # Update tqdm every step
+            elapsed = time.time() - start_time
+            tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0
+            ppl = math.exp(min(loss_val, 20.0))
+            postfix = {
+                "loss": f"{loss_val:.3f}",
+                "ppl": f"{ppl:.0f}",
+                "tok/s": f"{tokens_per_sec:.0f}",
+            }
+            if device.type == "cuda":
+                mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
+                postfix["VRAM"] = f"{mem_gb:.0f}G"
+            pbar.set_postfix(postfix)
+            pbar.update(1)
 
+            # Detailed logging at intervals
+            if step % args.log_every == 0:
                 aux_str = ""
                 if aux_loss is not None:
                     aux_str = f"  aux={aux_loss.item():.4f}"
@@ -451,10 +477,9 @@ def train(args):
                 )
 
                 if device.type == "cuda":
-                    mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
                     log_line += f" | VRAM {mem_gb:.1f}GB"
 
-                print(log_line)
+                tqdm.write(log_line)
 
                 # Wandb logging
                 if args.wandb and HAS_WANDB:
@@ -470,13 +495,13 @@ def train(args):
                     if aux_loss is not None:
                         log_dict["train/aux_loss"] = aux_loss.item()
                     if device.type == "cuda":
-                        log_dict["train/vram_gb"] = torch.cuda.max_memory_allocated() / (1024**3)
+                        log_dict["train/vram_gb"] = mem_gb
                     wandb.log(log_dict, step=step)
 
             # Evaluation
             if val_dataloader is not None and args.eval_every > 0 and step % args.eval_every == 0:
                 val_metrics = evaluate(model, val_dataloader, config, device, dtype)
-                print(
+                tqdm.write(
                     f"  [EVAL] step {step} | val_loss {val_metrics['val_loss']:.4f} "
                     f"| val_ppl {val_metrics['val_ppl']:.1f} ({val_metrics['val_batches']} batches)"
                 )
@@ -487,12 +512,15 @@ def train(args):
             if step % args.save_every == 0:
                 ckpt_path = os.path.join(args.checkpoint_dir, f"step_{step}.pt")
                 save_checkpoint(model, optimizer, step, loss_val, config, ckpt_path)
-                print(f"  Saved checkpoint: {ckpt_path}")
+                tqdm.write(f"  Saved checkpoint: {ckpt_path}")
 
                 if loss_val < best_loss:
                     best_loss = loss_val
                     best_path = os.path.join(args.checkpoint_dir, "best.pt")
                     save_checkpoint(model, optimizer, step, loss_val, config, best_path)
+
+    # Close progress bar
+    pbar.close()
 
     # Final checkpoint
     elapsed = time.time() - start_time
@@ -526,7 +554,7 @@ def main():
     parser.add_argument("--tokenizer", type=str, default="gpt2", help="Tokenizer path or HF name")
     parser.add_argument("--data-mode", choices=["inmemory", "streaming", "cached", "jsonl"], default="inmemory")
     parser.add_argument("--cache-dir", type=str, default=None, help="Cache directory for cached mode")
-    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers")
+    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
 
     # Model
     parser.add_argument("--model-size", choices=["tiny", "small", "medium", "large", "xlarge"], default="medium")
@@ -546,6 +574,7 @@ def main():
     parser.add_argument("--dtype", choices=["fp32", "fp16", "bf16"], default="bf16")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--no-flash-attn", action="store_true", help="Disable Flash Attention")
+    parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile()")
 
     # Optimizer
     parser.add_argument("--lr", type=float, default=5e-4)
