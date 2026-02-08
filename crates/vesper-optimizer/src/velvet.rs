@@ -3,7 +3,7 @@
 //! High-performance optimizer with adaptive features
 //! Utilise les kernels CUDA custom quand disponible
 
-use candle_core::{Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::VarMap;
 use std::collections::HashMap;
 
@@ -106,11 +106,23 @@ impl VelvetOptimizer {
     }
 
     fn update_param(&mut self, name: &str, param: &mut Tensor, grad: &Tensor) -> Result<()> {
-        // Get or create state
+        let orig_dtype = param.dtype();
+
+        // Mixed precision: cast to F32 for optimizer math (CUDA kernel requires F32)
+        if orig_dtype != DType::F32 {
+            *param = param.to_dtype(DType::F32)?;
+        }
+        let grad = if grad.dtype() != DType::F32 {
+            grad.to_dtype(DType::F32)?
+        } else {
+            grad.clone()
+        };
+
+        // Get or create state (always F32)
         if !self.state.contains_key(name) {
             self.state.insert(name.to_string(), OptimizerState {
-                m: Tensor::zeros_like(param)?,
-                v: Tensor::zeros_like(param)?,
+                m: Tensor::zeros(param.shape(), DType::F32, param.device())?,
+                v: Tensor::zeros(param.shape(), DType::F32, param.device())?,
                 step: 0,
             });
         }
@@ -144,7 +156,7 @@ impl VelvetOptimizer {
                 param,
                 &state.m,
                 &state.v,
-                grad,
+                &grad,
                 effective_lr as f32,
                 effective_beta1 as f32,
                 self.config.beta2 as f32,
@@ -158,6 +170,10 @@ impl VelvetOptimizer {
                 self.perplexity_scale as f32,
                 self.config.sparse_aware,
             )?;
+            // Cast back to original dtype (BF16/F16)
+            if orig_dtype != DType::F32 {
+                *param = param.to_dtype(orig_dtype)?;
+            }
             return Ok(());
         }
 
@@ -181,6 +197,11 @@ impl VelvetOptimizer {
         // Parameter update
         let update = (m_hat / (v_hat.sqrt()? + config_eps)?)?;
         *param = (param.clone() - (update * effective_lr)?)?;
+
+        // Cast back to original dtype (BF16/F16)
+        if orig_dtype != DType::F32 {
+            *param = param.to_dtype(orig_dtype)?;
+        }
 
         Ok(())
     }
@@ -206,7 +227,7 @@ impl VelvetOptimizer {
                 }
             }
             let global_norm = match &total_norm_sq {
-                Some(t) => (t.to_scalar::<f32>()? as f64).sqrt(),
+                Some(t) => (t.to_dtype(DType::F32)?.to_scalar::<f32>()? as f64).sqrt(),
                 None => 0.0,
             };
             self.last_grad_norm = global_norm;
