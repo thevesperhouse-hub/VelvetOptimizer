@@ -146,7 +146,7 @@ impl MoELayer {
         }
 
         // 5. Run each expert on ONLY its assigned tokens, scatter results back
-        let mut output_flat = Tensor::zeros((num_tokens, hidden), DType::F32, device)?;
+        let mut output_flat = Tensor::zeros((num_tokens, hidden), x.dtype(), device)?;
 
         for expert_id in 0..self.num_experts {
             let n_sel = expert_token_ids[expert_id].len();
@@ -163,10 +163,10 @@ impl MoELayer {
             // Run expert forward on subset only
             let expert_out = self.experts[expert_id].forward(&x_expert)?; // [n_sel, H]
 
-            // Weight outputs
+            // Weight outputs (convert to model dtype)
             let w = Tensor::from_vec(
                 expert_token_weights[expert_id].clone(), n_sel, device,
-            )?;
+            )?.to_dtype(x.dtype())?;
             let w_exp = w.unsqueeze(1)?.broadcast_as(expert_out.shape())?;
             let weighted = expert_out.mul(&w_exp)?; // [n_sel, H]
 
@@ -205,7 +205,7 @@ impl MoELayer {
         // Build assignment counts on GPU using eq + sum
         let mut expert_fractions = Vec::with_capacity(self.num_experts);
         for expert_id in 0..self.num_experts {
-            let mask = top_k_indices.eq(expert_id as u32)?.to_dtype(DType::F32)?;
+            let mask = top_k_indices.eq(expert_id as u32)?.to_dtype(router_probs.dtype())?;
             let count = mask.sum_all()?; // scalar
             let fraction = (count / total_assignments)?;
             expert_fractions.push(fraction);

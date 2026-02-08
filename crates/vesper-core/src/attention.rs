@@ -83,7 +83,7 @@ impl MultiHeadAttention {
         let attn_weights = if let Some(mask) = attention_mask {
             attn_weights.broadcast_add(mask)?
         } else {
-            let causal_mask = self.create_causal_mask(seq_len, q.device())?;
+            let causal_mask = self.create_causal_mask(seq_len, q.device(), q.dtype())?;
             attn_weights.broadcast_add(&causal_mask)?
         };
 
@@ -140,16 +140,16 @@ impl MultiHeadAttention {
         Ok(x.clone())
     }
 
-    fn create_causal_mask(&self, seq_len: usize, device: &Device) -> Result<Tensor> {
+    fn create_causal_mask(&self, seq_len: usize, device: &Device, dtype: DType) -> Result<Tensor> {
         let mut mask_data = vec![0.0f32; seq_len * seq_len];
-        
+
         for i in 0..seq_len {
             for j in (i + 1)..seq_len {
                 mask_data[i * seq_len + j] = -1e9;
             }
         }
 
-        Tensor::from_vec(mask_data, (1, 1, seq_len, seq_len), device)
+        Tensor::from_vec(mask_data, (1, 1, seq_len, seq_len), device)?.to_dtype(dtype)
     }
 }
 

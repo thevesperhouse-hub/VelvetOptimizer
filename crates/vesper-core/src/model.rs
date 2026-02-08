@@ -74,10 +74,11 @@ impl VesperLM {
                     }
                 }
                 let causal = Tensor::from_vec(causal_data, (1, 1, seq_len, seq_len), mask.device())?;
+                let causal = causal.to_dtype(hidden_states.dtype())?;
 
                 // Convert padding mask: [batch, seq] -> [batch, 1, 1, seq]
                 // 0 in mask -> -1e9, 1 in mask -> 0 (using -1e9 instead of -inf to avoid 0*-inf=NaN)
-                let padding_mask = mask.to_dtype(candle_core::DType::F32)?;
+                let padding_mask = mask.to_dtype(hidden_states.dtype())?;
                 let ones = Tensor::ones_like(&padding_mask)?;
                 let padding_mask = (ones.sub(&padding_mask)? * (-1e9 as f64))?;
                 let padding_mask = padding_mask.unsqueeze(1)?.unsqueeze(1)?;
