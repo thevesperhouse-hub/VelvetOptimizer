@@ -567,14 +567,25 @@ def train(args):
 
             # Checkpoint
             if step % args.save_every == 0:
-                ckpt_path = os.path.join(args.checkpoint_dir, f"step_{step}.pt")
-                save_checkpoint(model, optimizer, step, loss_val, config, ckpt_path)
-                tqdm.write(f"  Saved checkpoint: {ckpt_path}")
+                if not math.isfinite(loss_val):
+                    tqdm.write(f"  [WARN] Skipping checkpoint at step {step} — loss is NaN")
+                else:
+                    ckpt_path = os.path.join(args.checkpoint_dir, f"step_{step}.pt")
+                    save_checkpoint(model, optimizer, step, loss_val, config, ckpt_path)
+                    tqdm.write(f"  Saved checkpoint: {ckpt_path}")
 
-                if loss_val < best_loss:
-                    best_loss = loss_val
-                    best_path = os.path.join(args.checkpoint_dir, "best.pt")
-                    save_checkpoint(model, optimizer, step, loss_val, config, best_path)
+                    # Rotate: delete checkpoint from 2 saves ago (keep last 2 + best)
+                    old_step = step - 2 * args.save_every
+                    if old_step > 0:
+                        old_path = os.path.join(args.checkpoint_dir, f"step_{old_step}.pt")
+                        if os.path.exists(old_path):
+                            os.remove(old_path)
+
+                    if loss_val < best_loss:
+                        best_loss = loss_val
+                        best_path = os.path.join(args.checkpoint_dir, "best.pt")
+                        save_checkpoint(model, optimizer, step, loss_val, config, best_path)
+                        tqdm.write(f"  New best: loss={loss_val:.4f}")
 
     # Close progress bar
     pbar.close()
