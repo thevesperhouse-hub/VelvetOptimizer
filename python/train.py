@@ -212,6 +212,32 @@ def set_lr(optimizer: VelvetOptimizer, lr: float):
 
 
 # ---------------------------------------------------------------------------
+# Safe data iterator (catches worker timeouts)
+# ---------------------------------------------------------------------------
+
+def _safe_data_iter(data_iter, dataloader, pbar):
+    """Wrap data iterator to catch worker timeouts and recover."""
+    while True:
+        try:
+            batch = next(data_iter)
+            yield batch
+        except StopIteration:
+            return
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "timeout" in err_msg or "dataloader" in err_msg or "worker" in err_msg:
+                from tqdm import tqdm as _tqdm
+                _tqdm.write(f"  [WARN] DataLoader worker timeout — restarting data pipeline")
+                try:
+                    data_iter = iter(dataloader)
+                    continue
+                except Exception:
+                    _tqdm.write(f"  [ERROR] DataLoader restart failed — ending epoch")
+                    return
+            raise
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -404,9 +430,14 @@ def train(args):
 
     while step < args.max_steps and not _SHOULD_STOP:
         epoch += 1
-        data_iter = iter(dataloader)
 
-        for input_ids, labels in data_iter:
+        try:
+            data_iter = iter(dataloader)
+        except Exception as e:
+            tqdm.write(f"  [WARN] DataLoader restart failed: {e}")
+            break
+
+        for input_ids, labels in _safe_data_iter(data_iter, dataloader, pbar):
             if step >= args.max_steps or _SHOULD_STOP:
                 break
 

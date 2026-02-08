@@ -258,11 +258,20 @@ def create_dataloader(
     Args:
         mode: "inmemory", "streaming", "cached", or "jsonl"
     """
+    # timeout=60s on workers — raises instead of hanging forever on deadlock
+    worker_kwargs = {}
+    if num_workers > 0:
+        worker_kwargs = dict(
+            timeout=60,
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
+
     if mode == "streaming":
         dataset = StreamingTextDataset(dataset_path, tokenizer, seq_len)
         return DataLoader(
             dataset, batch_size=batch_size, num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=True, **worker_kwargs,
         )
     elif mode == "jsonl":
         dataset = JSONLDataset(dataset_path, tokenizer, seq_len)
@@ -274,4 +283,5 @@ def create_dataloader(
     return DataLoader(
         dataset, batch_size=batch_size, shuffle=shuffle,
         num_workers=num_workers, pin_memory=True, drop_last=True,
+        **worker_kwargs,
     )
