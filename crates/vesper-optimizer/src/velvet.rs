@@ -187,7 +187,7 @@ impl VelvetOptimizer {
 
         // Update moments
         let state = self.state.get_mut(name).unwrap();
-        state.m = (state.m.clone() * effective_beta1)?.add(&(grad * (1.0 - effective_beta1))?)?;
+        state.m = (state.m.clone() * effective_beta1)?.add(&(grad.clone() * (1.0 - effective_beta1))?)?;
         state.v = (state.v.clone() * config_beta2)?.add(&(grad.sqr()? * (1.0 - config_beta2))?)?;
 
         // Bias-corrected moments
