@@ -2,29 +2,30 @@
 # ==============================================
 # VelvetOptimizer - Vast.ai Instance Setup
 # ==============================================
-# Run this script on a fresh Vast.ai A100 instance.
+# Run this script on a fresh Vast.ai GPU instance.
+# Auto-detects GPU architecture (A100, RTX 6000, etc.)
 #
 # Usage:
-#   bash vastai_setup.sh [HF_TOKEN]
+#   bash vastai_setup.sh [DATASET_SIZE]
 #
-# Prerequisites: nvidia/cuda:12.4.1-devel-ubuntu22.04 template
+# DATASET_SIZE: 100M (default), 1B, 10B
+# Example:
+#   bash vastai_setup.sh 1B
 
 set -e
+
+DATASET_SIZE="${1:-1B}"
 
 echo "=== VelvetOptimizer - Vast.ai Setup ==="
 echo ""
 
-# HF token (for LLaMA tokenizer)
-if [ -n "$1" ]; then
-    export HF_TOKEN="$1"
-elif [ -z "$HF_TOKEN" ]; then
-    echo "WARNING: No HF_TOKEN set. LLaMA tokenizer won't work."
-    echo "Usage: bash vastai_setup.sh hf_your_token"
-    echo ""
-fi
+# 1. Detect GPU
+echo "[1/6] Detecting GPU..."
+nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader
+echo ""
 
-# 1. Install Rust
-echo "[1/5] Installing Rust..."
+# 2. Install Rust
+echo "[2/6] Installing Rust..."
 if ! command -v cargo &> /dev/null; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
     source "$HOME/.cargo/env"
@@ -32,61 +33,53 @@ else
     echo "  Rust already installed."
 fi
 
-# 2. Install Python deps
-echo "[2/5] Installing Python dependencies..."
+# 3. Install Python deps
+echo "[3/6] Installing Python dependencies..."
 pip3 install -q datasets matplotlib numpy
 
-# 3. Clone & build
-echo "[3/5] Cloning and building VelvetOptimizer..."
+# 4. Clone & build
+echo "[4/6] Cloning and building VelvetOptimizer..."
 cd /workspace
 if [ ! -d "VelvetOptimizer" ]; then
     git clone https://github.com/thevesperhouse-hub/VelvetOptimizer.git
 fi
 cd VelvetOptimizer
 
-echo "  Building with CUDA_ARCH=sm_80 (A100)..."
-CUDA_ARCH=sm_80 cargo build --release -p vesper-cli
+# Candle auto-detects GPU compute capability via nvidia-smi
+echo "  Building release (CUDA auto-detect)..."
+cargo build --release -p vesper-cli
 echo "  Build complete!"
 
-# 4. Download dataset
-echo "[4/5] Downloading FineWeb-Edu..."
-# 100M tokens for small/medium, 1B for large/xlarge
-python3 scripts/download_fineweb.py --tokens 100M --output /workspace/fineweb-100M.txt
-python3 scripts/download_fineweb.py --tokens 1B --output /workspace/fineweb-1B.txt
+# 5. Download dataset
+echo "[5/6] Downloading FineWeb-Edu (${DATASET_SIZE} tokens)..."
+python3 scripts/download_fineweb.py --tokens "$DATASET_SIZE" --output "/workspace/fineweb-${DATASET_SIZE}.txt"
 
-# 5. Run benchmarks
-echo "[5/5] Ready to benchmark!"
+# 6. Ready
+echo "[6/6] Setup complete!"
 echo ""
-echo "Commands:"
+echo "=== Training Commands ==="
 echo ""
-echo "  # Small model (quick test)"
-echo "  ./target/release/vesper benchmark \\"
-echo "    --dataset /workspace/fineweb-100M.txt \\"
-echo "    --tokenizer meta-llama/Llama-2-7b-hf \\"
-echo "    --model-size small --epochs 3 --batch-size 16 --lr 5e-4 \\"
-echo "    --output /workspace/benchmark_small.json"
+echo "  # Quick test (small model, ~5 min)"
+echo "  ./target/release/vesper train \\"
+echo "    --dataset /workspace/fineweb-${DATASET_SIZE}.txt \\"
+echo "    --model-size small --epochs 1 --batch-size 16 --seq-len 512 \\"
+echo "    --optimizer velvet --lr 5e-4 \\"
+echo "    --output-dir /workspace/checkpoints"
 echo ""
-echo "  # Medium model"
-echo "  ./target/release/vesper benchmark \\"
-echo "    --dataset /workspace/fineweb-100M.txt \\"
-echo "    --tokenizer meta-llama/Llama-2-7b-hf \\"
-echo "    --model-size medium --epochs 3 --batch-size 8 --lr 3e-4 \\"
-echo "    --output /workspace/benchmark_medium.json"
+echo "  # 1B model training (streaming)"
+echo "  ./target/release/vesper train \\"
+echo "    --streaming --chunk-mb 100 \\"
+echo "    --dataset /workspace/fineweb-${DATASET_SIZE}.txt \\"
+echo "    --model-size 1b --epochs 1 --batch-size 16 --seq-len 512 \\"
+echo "    --optimizer velvet --lr 5e-4 \\"
+echo "    --output-dir /workspace/checkpoints --save-every 500"
 echo ""
-echo "  # Large model"
-echo "  ./target/release/vesper benchmark \\"
-echo "    --dataset /workspace/fineweb-1B.txt \\"
-echo "    --tokenizer meta-llama/Llama-2-7b-hf \\"
-echo "    --model-size large --epochs 2 --batch-size 8 --lr 3e-4 \\"
-echo "    --output /workspace/benchmark_large.json"
-echo ""
-echo "  # XLarge / 1B params"
-echo "  ./target/release/vesper benchmark \\"
-echo "    --dataset /workspace/fineweb-1B.txt \\"
-echo "    --tokenizer meta-llama/Llama-2-7b-hf \\"
-echo "    --model-size xlarge --epochs 2 --batch-size 4 --lr 5e-4 \\"
-echo "    --output /workspace/benchmark_xlarge.json"
-echo ""
-echo "  # Plot results"
-echo "  python3 scripts/plot_benchmark.py /workspace/benchmark_small.json"
+echo "  # Resume from checkpoint"
+echo "  ./target/release/vesper train \\"
+echo "    --streaming --chunk-mb 100 \\"
+echo "    --dataset /workspace/fineweb-${DATASET_SIZE}.txt \\"
+echo "    --model-size 1b --epochs 1 --batch-size 16 --seq-len 512 \\"
+echo "    --optimizer velvet --lr 5e-4 \\"
+echo "    --output-dir /workspace/checkpoints --save-every 500 \\"
+echo "    --resume /workspace/checkpoints/latest.safetensors"
 echo ""
