@@ -77,13 +77,14 @@ impl OptimizerKind {
     /// Checkpointed training step: multi-phase backward through segments.
     /// Returns loss_val.
     ///
-    /// Phase 1: loss.backward() on logits from last segment. The live graph flows
-    ///          through final_norm + layers → boundary_vars[last] gets a gradient.
-    /// Phase 2: For each earlier segment in reverse, recompute forward + proxy loss backward.
+    /// Phase 0: Build logits from last_hidden via forward_head (manual layer norm with
+    ///          gradient flow). backward() gives dL/d(head_input). Then DROP the head
+    ///          computation graph to free GPU memory before recomputing segments.
+    /// Phase 1: For each segment in reverse, recompute forward + proxy loss backward.
     fn step_checkpointed(
         &mut self,
         model: &VesperLM,
-        checkpoint_data: &CheckpointData,
+        checkpoint_data: CheckpointData,  // by value — we drop fields to free GPU memory
         labels: &Tensor,
         input_ids: &Tensor,
         varmap: &VarMap,
@@ -91,48 +92,54 @@ impl OptimizerKind {
     ) -> Result<f32> {
         match self {
             OptimizerKind::Velvet(opt) => {
-                // Compute loss from logits (live graph from last segment through final_norm + lm_head)
-                let mut loss = compute_loss(&checkpoint_data.logits, labels)?;
+                // Destructure to control lifetimes and free memory early
+                let CheckpointData {
+                    boundary_vars, mask_4d, segment_ranges,
+                    last_hidden, total_aux_loss: _,
+                } = checkpoint_data;
 
-                // Add MoE aux_loss from last segment (live graph → MoE routing gets gradients)
-                if let Some(ref aux) = checkpoint_data.last_seg_aux_loss {
-                    loss = loss.add(&(aux.clone() * model.config().moe_aux_loss_weight)?)?;
-                }
+                // Phase 0: backward through head (manual layer norm + lm_head)
+                let head_input_var = candle_core::Var::from_tensor(&last_hidden)
+                    .map_err(|e| anyhow::anyhow!("Var::from_tensor failed: {}", e))?;
+                drop(last_hidden); // Free the detached copy
 
+                let logits = model.forward_head(head_input_var.as_tensor())
+                    .map_err(|e| anyhow::anyhow!("forward_head failed: {}", e))?;
+                let loss = compute_loss(&logits, labels)?;
                 let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
 
                 // Entropy-Adaptive LR + Perplexity-Guided Momentum
-                let current_entropy = compute_logits_entropy(&checkpoint_data.logits.detach(), vocab_size)?;
+                let current_entropy = compute_logits_entropy(&logits.detach(), vocab_size)?;
                 let entropy_scale = (current_entropy / 0.5).clamp(0.5, 2.0);
                 opt.set_entropy_scale(entropy_scale);
                 let current_ppl = (loss_val as f64).exp();
                 let ppl_scale = (40.0 / current_ppl.max(1.0)).clamp(0.5, 2.0);
                 opt.set_perplexity_scale(ppl_scale);
 
-                // Phase 1: backward through last segment (loss → lm_head → final_norm → layers → boundary)
-                let grad_store_last = loss.backward()
-                    .map_err(|e| anyhow::anyhow!("Backward last segment failed: {}", e))?;
+                let grad_store_head = loss.backward()
+                    .map_err(|e| anyhow::anyhow!("Backward head failed: {}", e))?;
 
-                let num_segments = checkpoint_data.segment_ranges.len();
-                let last_seg_idx = num_segments - 1;
-
-                // Extract upstream gradient from last segment's boundary Var
-                let upstream_grad = grad_store_last
-                    .get(checkpoint_data.boundary_vars[last_seg_idx].as_tensor())
+                let head_upstream = grad_store_head.get(head_input_var.as_tensor())
                     .ok_or_else(|| anyhow::anyhow!(
-                        "No upstream gradient for segment {} boundary", last_seg_idx
+                        "No gradient for head input Var (forward_head backward didn't reach it)"
                     ))?.clone();
 
-                let mut all_grad_stores: Vec<GradStore> = Vec::with_capacity(num_segments);
-                all_grad_stores.push(grad_store_last);
+                // Free the head computation graph (logits + loss + norm intermediates)
+                drop(loss);
+                drop(logits);
+                drop(head_input_var);
 
-                // Phase 2: backward through earlier segments in reverse using proxy loss
-                let mut upstream = upstream_grad;
+                // Phase 1: backward through ALL segments in reverse using proxy loss
+                let num_segments = segment_ranges.len();
+                let mut all_grad_stores: Vec<GradStore> = Vec::with_capacity(num_segments + 1);
+                all_grad_stores.push(grad_store_head);
 
-                for seg_idx in (0..last_seg_idx).rev() {
+                let mut upstream = head_upstream;
+
+                for seg_idx in (0..num_segments).rev() {
                     let (recomputed_output, recomputed_aux) = model.recompute_segment(
-                        seg_idx, input_ids, &checkpoint_data.boundary_vars,
-                        checkpoint_data.mask_4d.as_ref(), &checkpoint_data.segment_ranges,
+                        seg_idx, input_ids, &boundary_vars,
+                        mask_4d.as_ref(), &segment_ranges,
                     ).map_err(|e| anyhow::anyhow!("Recompute segment {} failed: {}", seg_idx, e))?;
 
                     // Proxy loss: (output * upstream_grad).sum_all()
@@ -150,7 +157,7 @@ impl OptimizerKind {
 
                     // Extract upstream gradient for the previous segment
                     if seg_idx > 0 {
-                        upstream = grad_store_seg.get(checkpoint_data.boundary_vars[seg_idx].as_tensor())
+                        upstream = grad_store_seg.get(boundary_vars[seg_idx].as_tensor())
                             .ok_or_else(|| anyhow::anyhow!(
                                 "No gradient for segment {} boundary", seg_idx
                             ))?.clone();
@@ -497,7 +504,7 @@ fn run_training_loop(
                 let ckpt = model.forward_checkpointed(&input_ids, Some(&attention_mask))
                     .map_err(|e| anyhow::anyhow!("Checkpointed forward failed: {}", e))?;
                 loss_val = optimizer.step_checkpointed(
-                    model, &ckpt, &labels, &input_ids, varmap, vocab_size,
+                    model, ckpt, &labels, &input_ids, varmap, vocab_size,
                 )?;
             } else {
                 let (logits, aux_loss_opt) = model.forward(&input_ids, Some(&attention_mask))?;
@@ -641,7 +648,7 @@ fn run_streaming_loop(
                     let ckpt = model.forward_checkpointed(&input_ids, Some(&attention_mask))
                         .map_err(|e| anyhow::anyhow!("Checkpointed forward failed: {}", e))?;
                     loss_val = optimizer.step_checkpointed(
-                        model, &ckpt, &labels, &input_ids, varmap, vocab_size,
+                        model, ckpt, &labels, &input_ids, varmap, vocab_size,
                     )?;
                 } else {
                     let (logits, aux_loss_opt) = model.forward(&input_ids, Some(&attention_mask))?;

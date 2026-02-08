@@ -3,7 +3,7 @@
 //! Transformer architecture with FlyLoRA and ERA activation
 
 use candle_core::{D, DType, Module, Result, Tensor, Var};
-use candle_nn::{embedding, Embedding, Init, LayerNorm, Linear, VarBuilder};
+use candle_nn::{embedding, Embedding, LayerNorm, Linear, VarBuilder};
 
 use crate::attention::MultiHeadAttention;
 use crate::config::VesperConfig;
@@ -11,60 +11,16 @@ use crate::era::ERAActivation;
 use crate::flylora::FlyLoRALinear;
 use crate::moe::MoELayer;
 
-/// Layer normalization using standard Candle ops with full backward support.
-///
-/// Candle's built-in `LayerNorm` uses a fused kernel (`apply_op3_no_bwd`) when the
-/// input is contiguous. That kernel severs the computation graph — gradients cannot
-/// flow through it. This struct implements the same math using standard ops (sub, sqr,
-/// div, mul, add) which all properly track autograd.
-struct TrainLayerNorm {
-    weight: Tensor,
-    bias: Tensor,
-    eps: f64,
-    hidden_size: usize,
-}
-
-impl TrainLayerNorm {
-    fn new(hidden_size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        // Same variable names as candle_nn::layer_norm → checkpoint compatible
-        let weight = vb.get_with_hints(hidden_size, "weight", Init::Const(1.))?;
-        let bias = vb.get_with_hints(hidden_size, "bias", Init::Const(0.))?;
-        Ok(Self { weight, bias, eps, hidden_size })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x_dtype = x.dtype();
-        let internal_dtype = match x_dtype {
-            DType::F16 | DType::BF16 => DType::F32,
-            d => d,
-        };
-        let hidden_f64 = self.hidden_size as f64;
-        let x = x.to_dtype(internal_dtype)?;
-        let mean = (x.sum_keepdim(D::Minus1)? / hidden_f64)?;
-        let x = x.broadcast_sub(&mean)?;
-        let var = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_f64)?;
-        let x_normed = x.broadcast_div(&(var + self.eps)?.sqrt()?)?;
-        x_normed
-            .to_dtype(x_dtype)?
-            .broadcast_mul(&self.weight)?
-            .broadcast_add(&self.bias)
-    }
-}
-
 /// Data produced by a checkpointed forward pass for multi-phase backward.
 pub struct CheckpointData {
     /// Boundary activations as Vars at each segment start.
-    /// backward() computes their gradients (is_variable=true).
     pub boundary_vars: Vec<Var>,
     /// Precomputed 4D attention mask (reused for all segment recomputations).
     pub mask_4d: Option<Tensor>,
     /// Layer ranges per segment: (start_inclusive, end_exclusive).
     pub segment_ranges: Vec<(usize, usize)>,
-    /// Logits from last segment with live computation graph (final_norm + lm_head applied).
-    /// loss.backward() on these propagates gradients to boundary_vars[last].
-    pub logits: Tensor,
-    /// MoE aux_loss from last segment (live graph, for backward).
-    pub last_seg_aux_loss: Option<Tensor>,
+    /// Raw output of the last segment (before final_norm + lm_head), detached.
+    pub last_hidden: Tensor,
     /// MoE aux_loss sum from all segments (detached, for logging only).
     pub total_aux_loss: Option<Tensor>,
 }
@@ -73,7 +29,7 @@ pub struct VesperLM {
     config: VesperConfig,
     embeddings: Embedding,
     layers: Vec<TransformerLayer>,
-    final_norm: TrainLayerNorm,
+    final_norm: LayerNorm,
     lm_head: Linear,
 }
 
@@ -95,7 +51,7 @@ impl VesperLM {
             )?);
         }
 
-        let final_norm = TrainLayerNorm::new(
+        let final_norm = candle_nn::layer_norm(
             config.hidden_size,
             config.layer_norm_eps,
             vb.pp("final_norm"),
@@ -124,7 +80,7 @@ impl VesperLM {
             &hidden_states, mask_4d.as_ref(), 0, self.layers.len(),
         )?;
 
-        // Final layer norm + language modeling head
+        // Final layer norm (fused kernel) + language modeling head
         let hidden_states = self.final_norm.forward(&hidden_states)?;
         let logits = self.lm_head.forward(&hidden_states)?;
         Ok((logits, total_aux_loss))
@@ -175,41 +131,26 @@ impl VesperLM {
                 seg_input, mask_4d.as_ref(), layer_start, layer_end,
             )?;
 
+            // Accumulate aux_loss (detached, for logging only)
+            if let Some(a) = seg_aux {
+                let a_det = a.detach();
+                total_aux = Some(match total_aux {
+                    Some(acc) => acc.add(&a_det)?,
+                    None => a_det,
+                });
+            }
+
             if is_last {
-                // Last segment: run final_norm + lm_head, keeping the live computation graph.
-                // backward() from loss will propagate through norm → layers → boundary_vars[last].
-                let normed = self.final_norm.forward(&seg_output)?;
-                let logits = self.lm_head.forward(&normed)?;
-
-                // Save last segment's aux_loss with live graph (for backward)
-                let last_seg_aux = seg_aux;
-
-                // Add to total_aux (detached, for logging only)
-                if let Some(ref a) = last_seg_aux {
-                    let a_det = a.detach();
-                    total_aux = Some(match total_aux {
-                        Some(acc) => acc.add(&a_det)?,
-                        None => a_det,
-                    });
-                }
-
+                // Detach last segment output — backward phase will recompute via forward_head.
+                // No live computation graph stored → frees all segment activations.
                 return Ok(CheckpointData {
                     boundary_vars,
                     mask_4d,
                     segment_ranges,
-                    logits,
-                    last_seg_aux_loss: last_seg_aux,
+                    last_hidden: seg_output.detach(),
                     total_aux_loss: total_aux,
                 });
             } else {
-                // Non-last: detach aux_loss for logging, then break graph at boundary
-                if let Some(a) = seg_aux {
-                    let a_det = a.detach();
-                    total_aux = Some(match total_aux {
-                        Some(acc) => acc.add(&a_det)?,
-                        None => a_det,
-                    });
-                }
                 // Copy data into a new Var, freeing this segment's activations
                 boundary_vars.push(Var::from_tensor(&seg_output)?);
             }
@@ -245,8 +186,29 @@ impl VesperLM {
 
     /// Apply final layer norm + language modeling head to hidden states.
     /// Used by checkpointed backward to recompute logits from a segment's output.
+    ///
+    /// Uses manual layer norm (standard ops) instead of the fused kernel so that
+    /// gradients can flow through to the input Var. The fused kernel
+    /// (`apply_op3_no_bwd`) severs the computation graph.
     pub fn forward_head(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        let normed = self.final_norm.forward(hidden_states)?;
+        // Manual layer norm using standard Candle ops (full backward support).
+        // Reads weight/bias from self.final_norm to stay checkpoint-compatible.
+        let x_dtype = hidden_states.dtype();
+        let internal_dtype = match x_dtype {
+            DType::F16 | DType::BF16 => DType::F32,
+            d => d,
+        };
+        let hidden_f64 = self.config.hidden_size as f64;
+        let x = hidden_states.to_dtype(internal_dtype)?;
+        let mean = (x.sum_keepdim(D::Minus1)? / hidden_f64)?;
+        let x = x.broadcast_sub(&mean)?;
+        let var = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_f64)?;
+        let x_normed = x.broadcast_div(&(var + self.config.layer_norm_eps)?.sqrt()?)?;
+        let normed = x_normed.to_dtype(x_dtype)?.broadcast_mul(self.final_norm.weight())?;
+        let normed = match self.final_norm.bias() {
+            Some(bias) => normed.broadcast_add(bias)?,
+            None => normed,
+        };
         self.lm_head.forward(&normed)
     }
 
