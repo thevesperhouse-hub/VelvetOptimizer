@@ -346,6 +346,24 @@ impl VelvetOptimizer {
     pub fn last_grad_norm(&self) -> f64 {
         self.last_grad_norm
     }
+
+    /// Current effective learning rate (lr * entropy_scale if adaptive)
+    pub fn effective_lr(&self) -> f64 {
+        if self.config.entropy_adaptive {
+            self.config.lr * self.entropy_scale
+        } else {
+            self.config.lr
+        }
+    }
+
+    /// Current effective β1 (beta1 * perplexity_scale, clamped, if guided)
+    pub fn effective_beta1(&self) -> f64 {
+        if self.config.perplexity_guided {
+            (self.config.beta1 * self.perplexity_scale).clamp(0.5, 0.999)
+        } else {
+            self.config.beta1
+        }
+    }
 }
 
 #[cfg(test)]

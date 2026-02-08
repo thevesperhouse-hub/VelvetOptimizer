@@ -35,6 +35,7 @@ struct TrainingLog {
 struct StepLog {
     step: usize,
     loss: f32,
+    ppl: f32,
 }
 
 /// Which optimizer to use
@@ -172,6 +173,22 @@ impl OptimizerKind {
         match self {
             OptimizerKind::Velvet(_) => "Velvet",
             OptimizerKind::AdamW(_) => "AdamW",
+        }
+    }
+
+    /// Format real-time metrics string for progress bar
+    fn metrics_str(&self, loss: f32, ppl: f32, step: usize) -> String {
+        match self {
+            OptimizerKind::Velvet(opt) => {
+                format!(
+                    "loss: {:.4} | ppl: {:.1} | lr: {:.2e} | \u{03B2}1: {:.3} | gnorm: {:.2} | step: {}",
+                    loss, ppl, opt.effective_lr(), opt.effective_beta1(),
+                    opt.last_grad_norm(), step,
+                )
+            }
+            OptimizerKind::AdamW(_) => {
+                format!("loss: {:.4} | ppl: {:.1} | step: {}", loss, ppl, step)
+            }
         }
     }
 }
@@ -432,7 +449,7 @@ fn run_training_loop(
 
         let pb = ProgressBar::new(num_batches as u64);
         pb.set_style(ProgressStyle::default_bar()
-            .template("  {bar:40.green/black} {pos}/{len} [{elapsed}<{eta}] {msg}")
+            .template("  {bar:30.green/black} {pos}/{len} [{elapsed}<{eta}] {msg}")
             .unwrap());
 
         let mut epoch_loss = 0.0;
@@ -491,11 +508,12 @@ fn run_training_loop(
             count += 1;
             global_step += 1;
 
-            log.steps.push(StepLog { step: global_step, loss: loss_val });
+            let ppl_val = (loss_val as f64).exp() as f32;
+            log.steps.push(StepLog { step: global_step, loss: loss_val, ppl: ppl_val });
 
-            if batch_idx % 50 == 0 {
-                pb.set_message(format!("loss: {:.4} | step: {}", epoch_loss / count as f32, global_step));
-            }
+            let avg_loss = epoch_loss / count as f32;
+            let avg_ppl = (avg_loss as f64).exp() as f32;
+            pb.set_message(optimizer.metrics_str(avg_loss, avg_ppl, global_step));
             pb.inc(1);
 
             // Periodic checkpoint + save log
@@ -634,11 +652,12 @@ fn run_streaming_loop(
                 epoch_count += 1;
                 global_step += 1;
 
-                log.steps.push(StepLog { step: global_step, loss: loss_val });
+                let ppl_val = (loss_val as f64).exp() as f32;
+                log.steps.push(StepLog { step: global_step, loss: loss_val, ppl: ppl_val });
 
-                if batch_idx % 50 == 0 {
-                    pb.set_message(format!("loss: {:.4}", epoch_loss / epoch_count as f32));
-                }
+                let avg_loss = epoch_loss / epoch_count as f32;
+                let avg_ppl = (avg_loss as f64).exp() as f32;
+                pb.set_message(optimizer.metrics_str(avg_loss, avg_ppl, global_step));
                 pb.inc(1);
 
                 if save_every > 0 && global_step % save_every == 0 {
