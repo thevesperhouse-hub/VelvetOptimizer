@@ -112,10 +112,23 @@ impl OptimizerKind {
                 let grad_store_head = loss.backward()
                     .map_err(|e| anyhow::anyhow!("Backward head failed: {}", e))?;
 
+                // Debug: inspect GradStore contents
+                let var_id = head_input_var.as_tensor().id();
+                let all_ids: Vec<_> = grad_store_head.get_ids().collect();
+                let found = grad_store_head.get(head_input_var.as_tensor()).is_some();
+                eprintln!("[DEBUG] head_input_var id={:?}, is_variable={}, track_op={}",
+                    var_id, head_input_var.as_tensor().is_variable(),
+                    head_input_var.as_tensor().track_op());
+                eprintln!("[DEBUG] GradStore has {} entries, contains var_id={}", all_ids.len(), found);
+                if !found && all_ids.len() < 30 {
+                    eprintln!("[DEBUG] GradStore ids: {:?}", all_ids);
+                }
+
                 // Extract dL/d(last_hidden) — this is the upstream gradient for all segments
                 let head_upstream = grad_store_head.get(head_input_var.as_tensor())
                     .ok_or_else(|| anyhow::anyhow!(
-                        "No gradient for head input Var (head backward didn't reach it)"
+                        "No gradient for head input Var (id={:?}, store has {} entries)",
+                        var_id, all_ids.len()
                     ))?.clone();
 
                 // Phase 1: backward through all segments in reverse using proxy loss
