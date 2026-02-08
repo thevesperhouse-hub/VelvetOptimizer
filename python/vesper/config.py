@@ -68,15 +68,22 @@ class VesperConfig:
         return self
 
     def total_params(self) -> int:
-        emb = self.vocab_size * self.hidden_size
-        attn = self.num_layers * (3 * self.hidden_size * (self.flylora_rank * 2) + self.hidden_size ** 2)
-        ffn_per_expert = 2 * self.hidden_size * self.intermediate_size
+        H, I, V, L = self.hidden_size, self.intermediate_size, self.vocab_size, self.num_layers
+        R = self.flylora_rank
+
+        emb = V * H  # embeddings (tied with lm_head)
+        # Attention: Q, K, V, O — plain nn.Linear (no FlyLoRA)
+        attn = L * 4 * (H * H + H)  # weight + bias
+        # FFN: gate_proj + up_proj (FlyLoRA) + down_proj (plain)
+        flylora_per = (H * I + I) + (H * R + R) + (R * I + I)  # base + lora_down + lora_up
+        ffn = L * (2 * flylora_per + (I * H + H))  # gate + up (FlyLoRA) + down (plain)
+
         if self.moe_enabled:
-            router = self.hidden_size * self.moe_num_experts
-            ffn = self.num_layers * (router + self.moe_num_experts * ffn_per_expert)
-        else:
-            ffn = self.num_layers * ffn_per_expert
-        norms = self.num_layers * 2 * self.hidden_size
+            router = L * (H * self.moe_num_experts + self.moe_num_experts)
+            expert_ffn = L * self.moe_num_experts * (2 * flylora_per + (I * H + H))
+            ffn = router + expert_ffn
+
+        norms = L * 2 * 2 * H + 2 * H  # layer norms (weight + bias) + final norm
         return emb + attn + ffn + norms
 
     def validate(self):

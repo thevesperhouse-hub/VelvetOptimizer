@@ -301,9 +301,12 @@ def train(args):
     print(f"  Trainable params: {trainable/1e6:.1f}M")
 
     # Compile model for speed (PyTorch 2.x)
-    if not args.no_compile and hasattr(torch, "compile"):
+    # NOTE: torch.compile conflicts with gradient checkpointing (bypasses recompute)
+    if not args.no_compile and hasattr(torch, "compile") and not config.gradient_checkpointing:
         print("  Compiling model with torch.compile()...")
         model = torch.compile(model)
+    elif config.gradient_checkpointing and not args.no_compile:
+        print("  Skipping torch.compile (incompatible with gradient checkpointing)")
 
     # Optimizer
     optimizer = VelvetOptimizer(
