@@ -80,9 +80,9 @@ impl VesperLM {
             &hidden_states, mask_4d.as_ref(), 0, self.layers.len(),
         )?;
 
-        // Final layer norm (fused kernel) + language modeling head
-        let hidden_states = self.final_norm.forward(&hidden_states)?;
-        let logits = self.lm_head.forward(&hidden_states)?;
+        // Manual layer norm + lm_head (forward_head uses standard ops so gradients
+        // flow through to all layers — the fused kernel severs the graph)
+        let logits = self.forward_head(&hidden_states)?;
         Ok((logits, total_aux_loss))
     }
 
