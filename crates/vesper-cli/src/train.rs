@@ -102,6 +102,7 @@ pub fn run(
     moe: bool,
     num_experts: usize,
     top_k: usize,
+    dtype_str: String,
 ) -> Result<()> {
     println!("\n=== VesperAI Training ===\n");
 
@@ -157,8 +158,16 @@ pub fn run(
     println!("  Vocab size: {}", vocab_size);
 
     // 4. Create model + optionally resume from checkpoint
+    let dtype = match dtype_str.as_str() {
+        "f32" => DType::F32,
+        "bf16" | "bfloat16" => DType::BF16,
+        "f16" | "float16" => DType::F16,
+        _ => anyhow::bail!("Unknown dtype: {}. Use: f32, bf16, f16", dtype_str),
+    };
+    println!("  Precision: {}", dtype_str);
+
     let mut varmap = VarMap::new();
-    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let vb = VarBuilder::from_varmap(&varmap, dtype, &device);
     let model = VesperLM::new(config.clone(), vb)?;
 
     let start_step = if let Some(ref ckpt) = resume {
@@ -362,7 +371,7 @@ fn run_training_loop(
             if let Some(aux_loss) = aux_loss_opt {
                 loss = loss.add(&(aux_loss * model.config().moe_aux_loss_weight)?)?;
             }
-            let loss_val = loss.to_scalar::<f32>()?;
+            let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
 
             // Backward + optimizer step
             optimizer.step(&loss, varmap, &logits, loss_val, vocab_size)?;
@@ -498,7 +507,7 @@ fn run_streaming_loop(
                 if let Some(aux_loss) = aux_loss_opt {
                     loss = loss.add(&(aux_loss * model.config().moe_aux_loss_weight)?)?;
                 }
-                let loss_val = loss.to_scalar::<f32>()?;
+                let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
 
                 optimizer.step(&loss, varmap, &logits, loss_val, vocab_size)?;
 
@@ -627,7 +636,7 @@ fn compute_logits_entropy(logits: &Tensor, vocab_size: usize) -> Result<f64> {
     let log_probs = probs.clamp(1e-10, 1.0)?.log()?;
     let entropy = (probs.mul(&log_probs)?.sum(last_dim)? * -1.0)?;
     let normalized = (entropy / max_entropy)?;
-    let mean = normalized.mean_all()?.to_scalar::<f32>()? as f64;
+    let mean = normalized.mean_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()? as f64;
     Ok(mean)
 }
 

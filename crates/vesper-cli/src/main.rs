@@ -111,6 +111,10 @@ enum Commands {
         /// Top-K experts per token (requires --moe)
         #[arg(long, default_value = "2")]
         top_k: usize,
+
+        /// Data type: f32, bf16, f16
+        #[arg(long, default_value = "bf16")]
+        dtype: String,
     },
 
     /// Benchmark Velvet optimizer vs AdamW
@@ -229,14 +233,14 @@ fn main() -> anyhow::Result<()> {
             epochs, batch_size, lr, seq_len,
             save_every, output_dir, max_steps, vocab_size,
             cache, streaming, chunk_mb, optimizer, resume,
-            moe, num_experts, top_k,
+            moe, num_experts, top_k, dtype,
         } => {
             train::run(
                 dataset, format, tokenizer, model_size,
                 epochs, batch_size, lr, seq_len,
                 save_every, output_dir, max_steps, vocab_size,
                 cache, streaming, chunk_mb, optimizer, resume,
-                moe, num_experts, top_k,
+                moe, num_experts, top_k, dtype,
             )?;
         }
 
