@@ -17,8 +17,10 @@ SQRT_2_OVER_PI = math.sqrt(2.0 / math.pi)
 
 @triton.jit
 def _tanh(x):
-    """Manual tanh — portable across all Triton versions."""
-    exp2x = tl.exp(2.0 * x)
+    """Manual tanh — portable across all Triton versions, numerically stable."""
+    # Clamp to [-20, 20] to prevent exp overflow (tanh saturates to +-1 beyond ~10)
+    x_clamped = tl.minimum(tl.maximum(x, -20.0), 20.0)
+    exp2x = tl.exp(2.0 * x_clamped)
     return (exp2x - 1.0) / (exp2x + 1.0)
 
 
