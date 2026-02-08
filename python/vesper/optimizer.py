@@ -66,12 +66,19 @@ class VelvetOptimizer(Optimizer):
 
     def set_loss_metrics(self, loss_val: float, vocab_size: int):
         """Update entropy/perplexity scales from current loss."""
+        if not math.isfinite(loss_val):
+            # NaN/Inf loss — reset scales to neutral to avoid amplifying instability
+            self._entropy_scale = 1.0
+            self._perplexity_scale = 1.0
+            return
+
         max_entropy = math.log(vocab_size)
         approx_entropy = min(loss_val, max_entropy) / max_entropy
-        self._entropy_scale = max(0.5, min(2.0, approx_entropy / 0.5))
+        # Clamp to [0.7, 1.3] — original [0.5, 2.0] was too aggressive and caused NaN
+        self._entropy_scale = max(0.7, min(1.3, approx_entropy / 0.5))
 
         ppl = math.exp(min(loss_val, 20.0))  # clamp to avoid overflow
-        self._perplexity_scale = max(0.5, min(2.0, 40.0 / max(ppl, 1.0)))
+        self._perplexity_scale = max(0.7, min(1.3, 40.0 / max(ppl, 1.0)))
 
     @property
     def effective_lr(self) -> float:

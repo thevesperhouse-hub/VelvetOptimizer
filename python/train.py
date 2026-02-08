@@ -426,9 +426,24 @@ def train(args):
 
             # Backward (accumulate gradients)
             scaler.scale(loss).backward()
-            accum_loss += loss.item() * args.grad_accum
+            loss_item = loss.item() * args.grad_accum
             micro_step += 1
             total_tokens += input_ids.numel()
+
+            # NaN detection — skip this micro-step entirely
+            if not math.isfinite(loss_item):
+                nan_count = getattr(train, '_nan_count', 0) + 1
+                train._nan_count = nan_count
+                optimizer.zero_grad()
+                micro_step = 0  # reset accumulation
+                accum_loss = 0.0
+                if nan_count <= 3:
+                    tqdm.write(f"  [WARN] NaN loss at micro-step — skipping (#{nan_count})")
+                elif nan_count == 10:
+                    tqdm.write(f"  [ERROR] 10 NaN losses — training is diverging. Try lower --lr")
+                continue
+
+            accum_loss += loss_item
 
             # Only step optimizer every grad_accum micro-steps
             if micro_step % args.grad_accum != 0:
@@ -441,6 +456,14 @@ def train(args):
             # Gradient clipping + step
             scaler.unscale_(optimizer)
             grad_norm = optimizer.clip_grad_norm_()
+
+            # Skip step if gradients are NaN (scaler handles this for fp16)
+            if not math.isfinite(grad_norm):
+                optimizer.zero_grad()
+                accum_loss = 0.0
+                tqdm.write(f"  [WARN] NaN gradients at step {step} — skipping optimizer step")
+                continue
+
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
