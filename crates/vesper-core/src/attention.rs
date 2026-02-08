@@ -2,7 +2,7 @@
 //! 
 //! Simplified attention without experimental features (NDA removed)
 
-use candle_core::{Device, Module, Result, Tensor};
+use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{Linear, VarBuilder};
 
 pub struct MultiHeadAttention {
