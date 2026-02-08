@@ -16,6 +16,13 @@ SQRT_2_OVER_PI = math.sqrt(2.0 / math.pi)
 
 
 @triton.jit
+def _tanh(x):
+    """Manual tanh — portable across all Triton versions."""
+    exp2x = tl.exp(2.0 * x)
+    return (exp2x - 1.0) / (exp2x + 1.0)
+
+
+@triton.jit
 def _era_forward_kernel(
     x_ptr, out_ptr,
     gamma,
@@ -32,7 +39,7 @@ def _era_forward_kernel(
     # 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     x3 = x * x * x
     inner = 0.7978845608028654 * (x + 0.044715 * x3)  # sqrt(2/pi)
-    tanh_inner = tl.extra.cuda.libdevice.tanh(inner)
+    tanh_inner = _tanh(inner)
     gelu = 0.5 * x * (1.0 + tanh_inner)
 
     # softplus(x) = log(1 + exp(x)), numerically stable
@@ -62,13 +69,13 @@ def _era_backward_kernel(
     # d(GELU)/dx (tanh approximation derivative)
     x3 = x * x * x
     inner = 0.7978845608028654 * (x + 0.044715 * x3)
-    tanh_inner = tl.extra.cuda.libdevice.tanh(inner)
+    tanh_inner = _tanh(inner)
     sech2 = 1.0 - tanh_inner * tanh_inner
     d_inner = 0.7978845608028654 * (1.0 + 3.0 * 0.044715 * x * x)
     d_gelu = 0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * d_inner
 
-    # d(softplus)/dx = sigmoid(x)
-    sigmoid_x = tl.sigmoid(x)
+    # d(softplus)/dx = sigmoid(x) = 1 / (1 + exp(-x))
+    sigmoid_x = 1.0 / (1.0 + tl.exp(-x))
     d_sp = sigmoid_x
 
     grad_in = grad_out * (d_gelu + gamma * d_sp)

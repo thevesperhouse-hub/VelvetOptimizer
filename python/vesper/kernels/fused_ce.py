@@ -102,8 +102,9 @@ def fused_cross_entropy(
 
     N = logits.shape[0]
 
-    # For small vocab, just use PyTorch (faster due to kernel launch overhead)
-    if V <= 8192:
+    # For vocab <= 65536, just use PyTorch (faster, avoids Triton kernel issues)
+    # Fused kernel only helps for very large vocabs (128K+) where full materialization is costly
+    if V <= 65536:
         return torch.nn.functional.cross_entropy(
             logits.float(), labels, reduction="mean"
         )
