@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use std::collections::HashMap;
-use vesper_core::{VesperConfig, VesperLM, CheckpointData, MappedDataset};
+use vesper_core::{VesperConfig, VesperLM, CheckpointData, LayerBoundaries, MappedDataset};
 use vesper_optimizer::{VelvetOptimizer, VelvetConfig};
 use vesper_training::{DatasetLoader, StreamingTextLoader};
 
@@ -45,33 +45,144 @@ enum OptimizerKind {
 }
 
 impl OptimizerKind {
-    fn step(
+    /// AdamW step: uses Candle's full autograd (all layers in one backward).
+    /// Only suitable for small batches due to Candle's memory model.
+    fn step_adamw(&mut self, loss: &Tensor) -> Result<()> {
+        match self {
+            OptimizerKind::AdamW(opt) => {
+                opt.backward_step(loss)?;
+            }
+            _ => anyhow::bail!("step_adamw called on non-AdamW optimizer"),
+        }
+        Ok(())
+    }
+
+    /// Layer-by-layer backward: recompute 1 layer at a time during backward.
+    ///
+    /// Memory: model(2GB) + optimizer(8GB) + 1 layer graph(~1-2GB) + boundaries(~0.5GB)
+    ///       = ~12-15GB for batch 10, ~27GB for batch 64.
+    /// vs full autograd: ~70GB for batch 10.
+    ///
+    /// The fused LayerNorm in each layer severs gradient flow through attention/FFN,
+    /// so the upstream gradient is constant across all layers (flows only through
+    /// residual connections). This means we can use the same upstream for every layer
+    /// — mathematically equivalent to Candle's full autograd for this architecture.
+    fn step_layerwise(
         &mut self,
-        loss: &Tensor,
+        model: &VesperLM,
+        boundaries: LayerBoundaries,
+        labels: &Tensor,
+        input_ids: &Tensor,
         varmap: &VarMap,
-        logits: &Tensor,
-        loss_val: f32,
-        vocab_size: usize,
-    ) -> Result<()> {
+    ) -> Result<f32> {
         match self {
             OptimizerKind::Velvet(opt) => {
-                // Entropy-Adaptive LR
-                let current_entropy = compute_logits_entropy(logits, vocab_size)?;
-                let entropy_scale = (current_entropy / 0.5).clamp(0.5, 2.0);
-                opt.set_entropy_scale(entropy_scale);
+                let LayerBoundaries { boundaries, mask_4d, num_layers } = boundaries;
+                let vocab_size = model.config().vocab_size;
+                let aux_weight = model.config().moe_aux_loss_weight;
 
-                // Perplexity-Guided Momentum
+                // Cache var tensor references for gradient extraction
+                let var_info: Vec<(String, Tensor)> = {
+                    let data = varmap.data().lock().unwrap();
+                    data.iter().map(|(n, v)| (n.clone(), v.as_tensor().clone())).collect()
+                };
+                let mut named_grads: HashMap<String, Tensor> = HashMap::new();
+
+                // === Phase 0: Head backward (manual layer norm + lm_head) ===
+                let head_input_var = candle_core::Var::from_tensor(&boundaries[num_layers])
+                    .map_err(|e| anyhow::anyhow!("Var::from_tensor failed: {}", e))?;
+
+                let logits = model.forward_head(head_input_var.as_tensor())
+                    .map_err(|e| anyhow::anyhow!("forward_head failed: {}", e))?;
+                let loss = compute_loss(&logits, labels)?;
+                let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+
+                // Entropy-adaptive LR from loss value (replaces compute_logits_entropy
+                // which wasted ~5GB creating [B, S, 128K] softmax/log/entropy tensors)
+                let max_entropy = (vocab_size as f64).ln();
+                let approx_entropy = ((loss_val as f64).min(max_entropy) / max_entropy).clamp(0.0, 1.0);
+                let entropy_scale = (approx_entropy / 0.5).clamp(0.5, 2.0);
+                opt.set_entropy_scale(entropy_scale);
                 let current_ppl = (loss_val as f64).exp();
                 let ppl_scale = (40.0 / current_ppl.max(1.0)).clamp(0.5, 2.0);
                 opt.set_perplexity_scale(ppl_scale);
 
-                opt.backward_step(loss, varmap)?;
+                let gs = loss.backward()
+                    .map_err(|e| anyhow::anyhow!("Head backward failed: {}", e))?;
+
+                // upstream = dL/d(head_input) — constant for all layers (see doc above)
+                let upstream = gs.get(head_input_var.as_tensor())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "No gradient for head input Var"
+                    ))?.clone();
+
+                // Extract head param grads (lm_head, final_norm weights)
+                for (name, tensor) in &var_info {
+                    if let Some(grad) = gs.get(tensor) {
+                        named_grads.insert(name.clone(), grad.clone());
+                    }
+                }
+
+                // Free head computation graph
+                drop(gs);
+                drop(logits);
+                drop(loss);
+                drop(head_input_var);
+
+                // === Phase 1: Layer-by-layer backward (reverse order) ===
+                // Each layer: recompute forward → proxy_loss → backward → extract grads → drop
+                // Peak memory: only 1 layer's computation graph alive at a time.
+                for layer_idx in (0..num_layers).rev() {
+                    // Layer 0: recompute from input_ids through embeddings (captures embedding grads)
+                    // Layer N>0: use detached boundary as input
+                    let input = if layer_idx == 0 {
+                        model.embeddings_forward(input_ids)
+                            .map_err(|e| anyhow::anyhow!("Embeddings forward failed: {}", e))?
+                    } else {
+                        boundaries[layer_idx].clone()
+                    };
+
+                    let (output, aux) = model.recompute_layer(
+                        layer_idx, &input, mask_4d.as_ref(),
+                    ).map_err(|e| anyhow::anyhow!("Recompute layer {} failed: {}", layer_idx, e))?;
+
+                    // Proxy loss: d(proxy)/d(output) = upstream, so backward gives correct param grads
+                    let mut proxy_loss = output.mul(&upstream.detach())?.sum_all()?;
+                    if let Some(a) = aux {
+                        proxy_loss = proxy_loss.add(&(a * aux_weight)?)?;
+                    }
+
+                    let gs = proxy_loss.backward()
+                        .map_err(|e| anyhow::anyhow!("Backward layer {} failed: {}", layer_idx, e))?;
+
+                    // Extract param grads for this layer (+ embeddings for layer 0)
+                    for (name, tensor) in &var_info {
+                        if let Some(grad) = gs.get(tensor) {
+                            named_grads.insert(name.clone(), grad.clone());
+                        }
+                    }
+
+                    // Free this layer's GradStore + computation graph
+                    drop(gs);
+                }
+
+                // Free boundaries and mask before optimizer step
+                drop(boundaries);
+                drop(mask_4d);
+                drop(upstream);
+
+                // Optimizer step with global gradient clipping
+                opt.step_with_named_grads(&named_grads, varmap)
+                    .map_err(|e| anyhow::anyhow!("Optimizer step failed: {}", e))?;
+
+                Ok(loss_val)
             }
-            OptimizerKind::AdamW(opt) => {
-                opt.backward_step(loss)?;
+            OptimizerKind::AdamW(_) => {
+                anyhow::bail!(
+                    "Layer-wise backward requires the Velvet optimizer. Use --optimizer velvet."
+                );
             }
         }
-        Ok(())
     }
 
     /// Checkpointed training step: multi-phase backward through segments.
@@ -121,9 +232,10 @@ impl OptimizerKind {
                 let loss = compute_loss(&logits, labels)?;
                 let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
 
-                // Entropy-Adaptive LR + Perplexity-Guided Momentum
-                let current_entropy = compute_logits_entropy(&logits.detach(), vocab_size)?;
-                let entropy_scale = (current_entropy / 0.5).clamp(0.5, 2.0);
+                // Entropy-Adaptive LR (from loss, avoids 5GB logits copy)
+                let max_entropy = (vocab_size as f64).ln();
+                let approx_entropy = ((loss_val as f64).min(max_entropy) / max_entropy).clamp(0.0, 1.0);
+                let entropy_scale = (approx_entropy / 0.5).clamp(0.5, 2.0);
                 opt.set_entropy_scale(entropy_scale);
                 let current_ppl = (loss_val as f64).exp();
                 let ppl_scale = (40.0 / current_ppl.max(1.0)).clamp(0.5, 2.0);
@@ -458,7 +570,7 @@ fn run_training_loop(
     model_size: &str,
     data: TrainingData,
 ) -> Result<()> {
-    let vocab_size = model.config().vocab_size;
+    let _vocab_size = model.config().vocab_size;
     let num_samples = match &data {
         TrainingData::InMemory(ds) => ds.len(),
         TrainingData::Cached(m) => m.num_sequences(),
@@ -530,20 +642,23 @@ fn run_training_loop(
 
             // Forward + backward + optimizer step
             let loss_val: f32;
-            if model.config().gradient_checkpoint_segments > 0 {
-                let ckpt = model.forward_checkpointed(&input_ids, Some(&attention_mask))
-                    .map_err(|e| anyhow::anyhow!("Checkpointed forward failed: {}", e))?;
-                loss_val = optimizer.step_checkpointed(
-                    model, ckpt, &labels, &input_ids, varmap, vocab_size,
+            let use_layerwise = matches!(optimizer, OptimizerKind::Velvet(_));
+            if use_layerwise {
+                // Layer-by-layer backward: ~12-15GB for batch 10, ~27GB for batch 64
+                let boundaries = model.forward_with_boundaries(&input_ids, Some(&attention_mask))
+                    .map_err(|e| anyhow::anyhow!("Forward failed: {}", e))?;
+                loss_val = optimizer.step_layerwise(
+                    model, boundaries, &labels, &input_ids, varmap,
                 )?;
             } else {
+                // AdamW: full autograd (high memory, small batches only)
                 let (logits, aux_loss_opt) = model.forward(&input_ids, Some(&attention_mask))?;
                 let mut loss = compute_loss(&logits, &labels)?;
                 if let Some(aux_loss) = aux_loss_opt {
                     loss = loss.add(&(aux_loss * model.config().moe_aux_loss_weight)?)?;
                 }
                 loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-                optimizer.step(&loss, varmap, &logits, loss_val, vocab_size)?;
+                optimizer.step_adamw(&loss)?;
             }
 
             epoch_loss += loss_val;
@@ -617,7 +732,7 @@ fn run_streaming_loop(
     optimizer_name: &str,
     model_size: &str,
 ) -> Result<()> {
-    let vocab_size = model.config().vocab_size;
+    let _vocab_size = model.config().vocab_size;
     let mut global_step: usize = start_step;
     let mut log = TrainingLog {
         optimizer: optimizer_name.to_string(),
@@ -674,11 +789,12 @@ fn run_streaming_loop(
                     prepare_batch_inmemory(&chunk_dataset, s, e, device)?;
 
                 let loss_val: f32;
-                if model.config().gradient_checkpoint_segments > 0 {
-                    let ckpt = model.forward_checkpointed(&input_ids, Some(&attention_mask))
-                        .map_err(|e| anyhow::anyhow!("Checkpointed forward failed: {}", e))?;
-                    loss_val = optimizer.step_checkpointed(
-                        model, ckpt, &labels, &input_ids, varmap, vocab_size,
+                let use_layerwise = matches!(optimizer, OptimizerKind::Velvet(_));
+                if use_layerwise {
+                    let boundaries = model.forward_with_boundaries(&input_ids, Some(&attention_mask))
+                        .map_err(|e| anyhow::anyhow!("Forward failed: {}", e))?;
+                    loss_val = optimizer.step_layerwise(
+                        model, boundaries, &labels, &input_ids, varmap,
                     )?;
                 } else {
                     let (logits, aux_loss_opt) = model.forward(&input_ids, Some(&attention_mask))?;
@@ -687,7 +803,7 @@ fn run_streaming_loop(
                         loss = loss.add(&(aux_loss * model.config().moe_aux_loss_weight)?)?;
                     }
                     loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-                    optimizer.step(&loss, varmap, &logits, loss_val, vocab_size)?;
+                    optimizer.step_adamw(&loss)?;
                 }
 
                 epoch_loss += loss_val;
@@ -806,18 +922,6 @@ fn compute_loss(logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
     let labels_1d = labels.flatten_all()?;
     cross_entropy(&logits_2d, &labels_1d)
         .map_err(|e| anyhow::anyhow!("Cross entropy failed: {}", e))
-}
-
-fn compute_logits_entropy(logits: &Tensor, vocab_size: usize) -> Result<f64> {
-    let max_entropy = (vocab_size as f64).ln();
-    let last_dim = logits.dims().len() - 1;
-    let logits_d = logits.detach();
-    let probs = candle_nn::ops::softmax(&logits_d, last_dim)?;
-    let log_probs = probs.clamp(1e-10, 1.0)?.log()?;
-    let entropy = (probs.mul(&log_probs)?.sum(last_dim)? * -1.0)?;
-    let normalized = (entropy / max_entropy)?;
-    let mean = normalized.mean_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()? as f64;
-    Ok(mean)
 }
 
 /// Extract step number from checkpoint filename.

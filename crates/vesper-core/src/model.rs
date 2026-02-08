@@ -25,6 +25,24 @@ pub struct CheckpointData {
     pub total_aux_loss: Option<Tensor>,
 }
 
+/// Boundary hidden states for layer-by-layer backward.
+///
+/// Each boundary is a detached tensor — the computation graph for each layer is
+/// freed immediately after forward. During backward, each layer is recomputed
+/// one at a time, keeping only ~1 layer's intermediates in memory.
+///
+/// Memory: model + optimizer + 1 layer's graph ≈ 12-15GB for batch 10.
+/// vs full autograd: model + optimizer + ALL layers' graphs ≈ 70GB.
+pub struct LayerBoundaries {
+    /// Detached hidden states: boundaries[i] = input to layer i,
+    /// boundaries[num_layers] = input to head (output of last layer).
+    pub boundaries: Vec<Tensor>,
+    /// Precomputed 4D attention mask (reused during layer backward).
+    pub mask_4d: Option<Tensor>,
+    /// Number of transformer layers.
+    pub num_layers: usize,
+}
+
 pub struct VesperLM {
     config: VesperConfig,
     embeddings: Embedding,
@@ -214,6 +232,66 @@ impl VesperLM {
 
     pub fn config(&self) -> &VesperConfig {
         &self.config
+    }
+
+    /// Forward through all layers, detaching at each boundary.
+    ///
+    /// Unlike `forward()` which builds a computation graph spanning ALL layers
+    /// (consuming ~26GB for 24-layer 1B model), this method detaches after each
+    /// layer so intermediate tensors are freed immediately. Only the boundary
+    /// hidden states (~0.5GB for batch 10) are retained.
+    ///
+    /// The caller performs backward layer-by-layer using `recompute_layer()`.
+    pub fn forward_with_boundaries(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<LayerBoundaries> {
+        let embedded = self.embeddings.forward(input_ids)?;
+        let mask_4d = Self::compute_mask_4d(attention_mask, embedded.dtype())?;
+
+        let num_layers = self.layers.len();
+        let mut boundaries = Vec::with_capacity(num_layers + 1);
+
+        // boundaries[0] = input to layer 0 (embedding output, detached)
+        let mut h = embedded.detach();
+        boundaries.push(h.clone());
+
+        for layer in &self.layers {
+            let (new_h, _aux) = layer.forward(&h, mask_4d.as_ref())?;
+            // Detach: frees this layer's computation graph (attention scores, FFN intermediates)
+            h = new_h.detach();
+            boundaries.push(h.clone());
+        }
+        // boundaries[num_layers] = output of last layer = input to head
+
+        Ok(LayerBoundaries {
+            boundaries,
+            mask_4d,
+            num_layers,
+        })
+    }
+
+    /// Recompute a single layer's forward pass from its boundary input.
+    /// Used during layer-by-layer backward to rebuild the computation graph
+    /// for just one layer at a time.
+    pub fn recompute_layer(
+        &self,
+        layer_idx: usize,
+        input: &Tensor,
+        mask_4d: Option<&Tensor>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        self.layers[layer_idx].forward(input, mask_4d)
+    }
+
+    /// Forward through embeddings only.
+    /// Used during layer 0 backward to capture embedding parameter gradients.
+    pub fn embeddings_forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.embeddings.forward(input_ids)
+    }
+
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
     }
 
     /// Compute 4D causal+padding attention mask from an optional 2D mask.
