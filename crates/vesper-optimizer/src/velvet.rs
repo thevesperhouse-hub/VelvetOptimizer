@@ -327,6 +327,62 @@ impl VelvetOptimizer {
         Ok(())
     }
 
+    /// Step using pre-extracted named gradients (avoids holding full GradStores).
+    /// Each GradStore from backward() contains gradients for ALL intermediate tensors
+    /// (~2.5GB per segment). This method accepts only the parameter gradients (~600MB
+    /// total), allowing callers to drop GradStores eagerly and free GPU memory.
+    pub fn step_with_named_grads(
+        &mut self,
+        grads: &HashMap<String, Tensor>,
+        varmap: &VarMap,
+    ) -> Result<()> {
+        self.step += 1;
+        let data = varmap.data().lock().unwrap();
+
+        // Pass 1: compute global gradient norm
+        let clip_coef = if self.config.max_grad_norm > 0.0 {
+            let mut total_norm_sq: Option<Tensor> = None;
+            for (name, _var) in data.iter() {
+                if let Some(grad) = grads.get(name) {
+                    let sq_sum = grad.sqr()?.sum_all()?;
+                    total_norm_sq = Some(match total_norm_sq {
+                        Some(acc) => acc.add(&sq_sum)?,
+                        None => sq_sum,
+                    });
+                }
+            }
+            let global_norm = match &total_norm_sq {
+                Some(t) => (t.to_dtype(DType::F32)?.to_scalar::<f32>()? as f64).sqrt(),
+                None => 0.0,
+            };
+            self.last_grad_norm = global_norm;
+
+            if global_norm > self.config.max_grad_norm {
+                self.config.max_grad_norm / (global_norm + 1e-6)
+            } else {
+                1.0
+            }
+        } else {
+            self.last_grad_norm = 0.0;
+            1.0
+        };
+
+        // Pass 2: apply updates with clipped gradients
+        for (name, var) in data.iter() {
+            if let Some(grad) = grads.get(name) {
+                let grad = if clip_coef < 1.0 {
+                    (grad.clone() * clip_coef)?
+                } else {
+                    grad.clone()
+                };
+                let mut param_tensor = var.as_tensor().detach();
+                self.update_param(name, &mut param_tensor, &grad)?;
+                let _ = var.set(&param_tensor);
+            }
+        }
+        Ok(())
+    }
+
     pub fn set_entropy_scale(&mut self, scale: f64) {
         self.entropy_scale = scale;
     }

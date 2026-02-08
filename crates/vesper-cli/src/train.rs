@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use candle_core::backprop::GradStore;
+use std::collections::HashMap;
 use vesper_core::{VesperConfig, VesperLM, CheckpointData, MappedDataset};
 use vesper_optimizer::{VelvetOptimizer, VelvetConfig};
 use vesper_training::{DatasetLoader, StreamingTextLoader};
@@ -79,12 +79,19 @@ impl OptimizerKind {
     ///
     /// Phase 0: Build logits from last_hidden via forward_head (manual layer norm with
     ///          gradient flow). backward() gives dL/d(head_input). Then DROP the head
-    ///          computation graph to free GPU memory before recomputing segments.
+    ///          GradStore to free intermediate gradient tensors (~1GB).
     /// Phase 1: For each segment in reverse, recompute forward + proxy loss backward.
+    ///          After each backward, extract ONLY parameter gradients into a HashMap
+    ///          and DROP the GradStore (which holds ~2.5GB of intermediate gradients).
+    ///
+    /// Key optimization: GradStore from backward() holds gradients for ALL computation
+    /// graph nodes (attention scores, FFN intermediates, etc.), not just parameters.
+    /// By extracting only parameter gradients and dropping the GradStore immediately,
+    /// we save ~2.5GB per segment (~15GB total for 6 segments).
     fn step_checkpointed(
         &mut self,
         model: &VesperLM,
-        checkpoint_data: CheckpointData,  // by value — we drop fields to free GPU memory
+        checkpoint_data: CheckpointData,
         labels: &Tensor,
         input_ids: &Tensor,
         varmap: &VarMap,
@@ -92,16 +99,22 @@ impl OptimizerKind {
     ) -> Result<f32> {
         match self {
             OptimizerKind::Velvet(opt) => {
-                // Destructure to control lifetimes and free memory early
                 let CheckpointData {
                     boundary_vars, mask_4d, segment_ranges,
                     last_hidden, total_aux_loss: _,
                 } = checkpoint_data;
 
+                // Cache var references for gradient extraction (avoids repeated varmap locking)
+                let var_info: Vec<(String, Tensor)> = {
+                    let data = varmap.data().lock().unwrap();
+                    data.iter().map(|(n, v)| (n.clone(), v.as_tensor().clone())).collect()
+                };
+                let mut named_grads: HashMap<String, Tensor> = HashMap::new();
+
                 // Phase 0: backward through head (manual layer norm + lm_head)
                 let head_input_var = candle_core::Var::from_tensor(&last_hidden)
                     .map_err(|e| anyhow::anyhow!("Var::from_tensor failed: {}", e))?;
-                drop(last_hidden); // Free the detached copy
+                drop(last_hidden);
 
                 let logits = model.forward_head(head_input_var.as_tensor())
                     .map_err(|e| anyhow::anyhow!("forward_head failed: {}", e))?;
@@ -124,16 +137,21 @@ impl OptimizerKind {
                         "No gradient for head input Var (forward_head backward didn't reach it)"
                     ))?.clone();
 
-                // Free the head computation graph (logits + loss + norm intermediates)
+                // Extract ONLY parameter gradients from head (lm_head, final_norm weights)
+                for (name, tensor) in &var_info {
+                    if let Some(grad) = grad_store_head.get(tensor) {
+                        named_grads.insert(name.clone(), grad.clone());
+                    }
+                }
+
+                // Free head computation graph + all intermediate gradient tensors
                 drop(loss);
                 drop(logits);
                 drop(head_input_var);
+                drop(grad_store_head);
 
                 // Phase 1: backward through ALL segments in reverse using proxy loss
                 let num_segments = segment_ranges.len();
-                let mut all_grad_stores: Vec<GradStore> = Vec::with_capacity(num_segments + 1);
-                all_grad_stores.push(grad_store_head);
-
                 let mut upstream = head_upstream;
 
                 for seg_idx in (0..num_segments).rev() {
@@ -145,7 +163,6 @@ impl OptimizerKind {
                     // Proxy loss: (output * upstream_grad).sum_all()
                     let mut proxy_loss = recomputed_output.mul(&upstream.detach())?.sum_all()?;
 
-                    // Add MoE aux_loss from this segment
                     if let Some(aux) = recomputed_aux {
                         proxy_loss = proxy_loss.add(
                             &(aux * model.config().moe_aux_loss_weight)?,
@@ -163,11 +180,24 @@ impl OptimizerKind {
                             ))?.clone();
                     }
 
-                    all_grad_stores.push(grad_store_seg);
+                    // Extract ONLY parameter gradients (not intermediate gradients)
+                    for (name, tensor) in &var_info {
+                        if let Some(grad) = grad_store_seg.get(tensor) {
+                            named_grads.insert(name.clone(), grad.clone());
+                        }
+                    }
+
+                    // DROP the full GradStore — frees ~2.5GB of intermediate gradient tensors
+                    drop(grad_store_seg);
                 }
 
-                // Optimizer step with all collected gradients
-                opt.backward_step_from_grad_stores(&all_grad_stores, varmap)
+                // Free boundary vars and mask before optimizer step
+                drop(boundary_vars);
+                drop(mask_4d);
+                drop(upstream);
+
+                // Optimizer step with extracted parameter gradients + global clipping
+                opt.step_with_named_grads(&named_grads, varmap)
                     .map_err(|e| anyhow::anyhow!("Optimizer step failed: {}", e))?;
 
                 Ok(loss_val)
