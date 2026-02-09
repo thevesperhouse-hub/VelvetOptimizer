@@ -151,12 +151,15 @@ def save_checkpoint(
     loss: float,
     config: VesperConfig,
     path: str,
+    lightweight: bool = True,
 ):
-    """Save training checkpoint."""
+    """Save training checkpoint.
+    lightweight=True: model weights only (~2.6GB for 1.3B). Default.
+    lightweight=False: includes optimizer state (~13GB). For exact resume.
+    """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    torch.save({
+    ckpt = {
         "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
         "step": step,
         "loss": loss,
         "config": {
@@ -174,7 +177,10 @@ def save_checkpoint(
             "moe_num_experts": config.moe_num_experts,
             "moe_top_k": config.moe_top_k,
         },
-    }, path)
+    }
+    if not lightweight:
+        ckpt["optimizer_state_dict"] = optimizer.state_dict()
+    torch.save(ckpt, path)
 
 
 def load_checkpoint(
