@@ -600,8 +600,8 @@ def train(args):
     elapsed = time.time() - start_time
     print(f"\nTraining complete: {step} steps in {elapsed:.1f}s")
     final_path = os.path.join(args.checkpoint_dir, f"final_step_{step}.pt")
-    save_checkpoint(model, optimizer, step, loss_val, config, final_path)
-    print(f"Saved final checkpoint: {final_path}")
+    save_checkpoint(model, optimizer, step, loss_val, config, final_path, lightweight=False)
+    print(f"Saved final checkpoint (full, with optimizer state): {final_path}")
 
     if device.type == "cuda":
         print(f"Peak VRAM: {torch.cuda.max_memory_allocated() / (1024**3):.1f}GB")
